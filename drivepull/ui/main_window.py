@@ -7,23 +7,112 @@ import threading
 
 from PySide6.QtCore import QObject, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QKeySequence
-from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QCheckBox, QFileDialog, QFrame,
+from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QCheckBox, QComboBox, QFileDialog, QFrame,
+                               QToolButton,
                                QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMenu,
                                QMessageBox, QPushButton, QStackedWidget, QTreeWidget,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 
 from ..config import APP_NAME, APP_VERSION, Settings
 from ..drive import DriveItem, DriveLink, list_api, list_public, parse_link, probe_public_sizes
-from ..engine import STATUS_LABEL, DownloadError
+from ..engine import STATUS_LABEL, UNFINISHED, DownloadError
 from ..service import Service
 from . import style
-from .grid import ThumbGrid, info_text
+from .grid import ThumbGrid, info_text, sort_value
 from .settings_dialog import SettingsDialog
 from .thumbs import ThumbLoader
 from .widgets import (PROGRESS_ROLE, STATUS_ROLE, FadeIn, ProgressDelegate, Spinner, fmt_eta,
-                      fmt_size, fmt_speed)
+                      fmt_size, fmt_speed, make_icon, natural_key)
 
 ITEM_ROLE = Qt.UserRole + 1
+SORT_ROLE = Qt.UserRole + 30
+SORT_KEYS = [("name", "이름"), ("size", "크기"), ("type", "종류"), ("modified", "수정일")]
+SORT_COLS = {"name": 0, "info": 1, "size": 2, "type": 3, "modified": 4}
+COL_KEYS = {v: k for k, v in SORT_COLS.items()}
+RUNNING = ("downloading", "starting", "verifying")
+
+
+class FileItem(QTreeWidgetItem):
+    """폴더는 항상 위, 이름은 숫자를 숫자로 비교 (A2 < A10)."""
+
+    def __lt__(self, other):
+        tw = self.treeWidget()
+        desc = tw.header().sortIndicatorOrder() == Qt.DescendingOrder if tw else False
+        a, b = self.data(0, ITEM_ROLE), other.data(0, ITEM_ROLE)
+        if a is None or b is None:
+            return False
+        if a.is_folder != b.is_folder:
+            return a.is_folder != desc
+        key = COL_KEYS.get(tw.sortColumn() if tw else 0, "name")
+        va, vb = sort_value(a, key), sort_value(b, key)
+        if va == vb:
+            return natural_key(a.name) < natural_key(b.name)
+        return va < vb
+
+
+class DlItem(QTreeWidgetItem):
+    def __lt__(self, other):
+        tw = self.treeWidget()
+        col = tw.sortColumn() if tw else 0
+        va, vb = self.data(col, SORT_ROLE), other.data(col, SORT_ROLE)
+        if va is None or vb is None or va == vb:
+            return natural_key(self.text(0)) < natural_key(other.text(0))
+        return va < vb
+
+
+class RowActions(QWidget):
+    """다운로드 목록 각 줄의 일시정지/재개, 취소, 삭제 버튼."""
+
+    clicked = Signal(str, str)   # action, uid
+
+    def __init__(self, uid: str):
+        super().__init__()
+        self.uid = uid
+        self.status = None
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(4, 0, 4, 0)
+        lay.setSpacing(2)
+        self.toggle = self._btn("toggle")
+        self.cancel = self._btn("cancel", "cancel", "취소 (받던 임시 파일 삭제)")
+        self.delete = self._btn("delete", "trash", "목록에서 삭제")
+        for b in (self.toggle, self.cancel, self.delete):
+            sp = b.sizePolicy()
+            sp.setRetainSizeWhenHidden(True)   # 숨겨도 버튼 위치가 밀리지 않게
+            b.setSizePolicy(sp)
+            lay.addWidget(b)
+        lay.addStretch(1)
+
+    def _btn(self, action, icon=None, tip=""):
+        b = QToolButton()
+        b.setAutoRaise(True)
+        b.setCursor(Qt.PointingHandCursor)
+        b.setIconSize(QSize(16, 16))
+        b.setFixedSize(28, 26)
+        if icon:
+            b.setIcon(make_icon(icon))
+        b.setToolTip(tip)
+        b.clicked.connect(lambda: self.clicked.emit(action, self.uid))
+        return b
+
+    def set_status(self, status: str):
+        if status == self.status:
+            return
+        self.status = status
+        if status in RUNNING or status in ("queued", "waiting"):
+            self.toggle.setIcon(make_icon("pause"))
+            self.toggle.setToolTip("일시정지")
+        elif status in ("done", "skipped"):
+            self.toggle.setIcon(make_icon("folder"))
+            self.toggle.setToolTip("폴더 열기")
+        elif status in ("error", "canceled"):
+            self.toggle.setIcon(make_icon("retry"))
+            self.toggle.setToolTip("다시 받기" if status == "canceled" else "다시 시도")
+        else:
+            self.toggle.setIcon(make_icon("play"))
+            self.toggle.setToolTip("재개")
+        self.cancel.setVisible(status in UNFINISHED)
+        self.delete.setToolTip("목록에서 삭제 (받은 파일은 그대로)" if status in ("done", "skipped")
+                               else "목록에서 삭제 (받던 임시 파일도 삭제)")
 
 
 class Bridge(QObject):
@@ -66,8 +155,11 @@ class MainWindow(QMainWindow):
         self._dl_timer = QTimer(self, interval=400, timeout=self._refresh_downloads)
         self._dl_timer.start()
         self._refresh_downloads()
-        if any(t.status == "paused" for t in self.svc.manager.snapshot()):
-            self._toast("이전에 받던 파일이 있어요. 다운로드 탭에서 이어받을 수 있어요.")
+        if self.svc.manager.partial_tasks():
+            if self.s.cleanup_on_exit:
+                QTimer.singleShot(400, self._ask_leftovers)
+            else:
+                self._toast("이전에 받던 파일이 있어요. 다운로드 탭에서 이어받을 수 있어요.")
 
     # ================================================================ 레이아웃
     def _build(self):
@@ -181,6 +273,23 @@ class MainWindow(QMainWindow):
             vl.addWidget(b)
         self.view_group.idClicked.connect(self._set_view)
         head.addWidget(vw)
+        self.sort_combo = QComboBox()
+        for k, label in SORT_KEYS:
+            self.sort_combo.addItem(f"{label}순", k)
+        self.sort_combo.setFixedWidth(96)
+        self.sort_combo.setToolTip("정렬 기준")
+        self.sort_dir = QToolButton()
+        self.sort_dir.setAutoRaise(True)
+        self.sort_dir.setCursor(Qt.PointingHandCursor)
+        self.sort_dir.setFixedSize(32, 32)
+        self.sort_dir.setIconSize(QSize(16, 16))
+        self.sort_dir.setIcon(make_icon("desc" if self.s.sort_desc else "asc"))
+        idx = max(0, [k for k, _ in SORT_KEYS].index(self.s.sort_key) if self.s.sort_key in dict(SORT_KEYS) else 0)
+        self.sort_combo.setCurrentIndex(idx)
+        self.sort_combo.currentIndexChanged.connect(lambda *_: self._apply_sort(save=True))
+        self.sort_dir.clicked.connect(self._flip_sort)
+        head.addWidget(self.sort_combo)
+        head.addWidget(self.sort_dir)
         self.filter = QLineEdit()
         self.filter.setPlaceholderText("이름·확장자 검색 (예: .mov)")
         self.filter.setFixedWidth(240)
@@ -195,7 +304,7 @@ class MainWindow(QMainWindow):
         v.addLayout(head)
 
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["이름", "정보", "크기", "종류"])
+        self.tree.setHeaderLabels(["이름", "정보", "크기", "종류", "수정일"])
         self.tree.setAlternatingRowColors(True)
         self.tree.setUniformRowHeights(True)
         self.tree.setAnimated(True)
@@ -204,10 +313,13 @@ class MainWindow(QMainWindow):
         hh = self.tree.header()
         hh.setStretchLastSection(False)
         hh.setSectionResizeMode(0, QHeaderView.Stretch)
-        for col, wd in ((1, 150), (2, 100), (3, 80)):
+        for col, wd in ((1, 150), (2, 100), (3, 80), (4, 100)):
             hh.setSectionResizeMode(col, QHeaderView.Fixed)
             self.tree.setColumnWidth(col, wd)
         self.tree.itemChanged.connect(lambda *_: self._summary_timer.start())
+        hh.setSortIndicatorShown(True)
+        hh.setSectionsClickable(True)
+        hh.sortIndicatorChanged.connect(self._on_tree_sort_clicked)
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._tree_menu)
         space = QAction(self.tree)
@@ -279,7 +391,7 @@ class MainWindow(QMainWindow):
 
         self.dl = QTreeWidget()
         self.dl.setRootIsDecorated(False)
-        self.dl.setHeaderLabels(["이름", "크기", "진행률", "속도", "남은 시간", "상태"])
+        self.dl.setHeaderLabels(["이름", "크기", "진행률", "속도", "남은 시간", "상태", ""])
         self.dl.setUniformRowHeights(True)
         self.dl.setTextElideMode(Qt.ElideMiddle)
         self.dl.setAlternatingRowColors(True)
@@ -288,9 +400,13 @@ class MainWindow(QMainWindow):
         hh = self.dl.header()
         hh.setStretchLastSection(False)
         hh.setSectionResizeMode(0, QHeaderView.Stretch)
-        for col, wd in ((1, 90), (2, 220), (3, 100), (4, 90), (5, 150)):
+        for col, wd in ((1, 90), (2, 200), (3, 100), (4, 90), (5, 170), (6, 104)):
             hh.setSectionResizeMode(col, QHeaderView.Fixed)
             self.dl.setColumnWidth(col, wd)
+        # 머리글을 누르면 정렬 (처음엔 추가한 순서)
+        hh.setSortIndicator(-1, Qt.AscendingOrder)
+        hh.setSortIndicatorShown(True)
+        self.dl.setSortingEnabled(True)
         self.dl.setContextMenuPolicy(Qt.CustomContextMenu)
         self.dl.customContextMenuRequested.connect(self._dl_menu)
         self.dl.itemDoubleClicked.connect(lambda it, _: self._open_folder([it.data(0, ITEM_ROLE)]))
@@ -461,6 +577,7 @@ class MainWindow(QMainWindow):
         self.tree.clear()
         self._id_to_items.clear()
         top = self._make_item(root, None)
+        self.tree.setSortingEnabled(False)
         self.tree.addTopLevelItem(top)
         top.setExpanded(True)
         self.tree.blockSignals(False)
@@ -469,6 +586,7 @@ class MainWindow(QMainWindow):
         mode = "" if root.mode == "api" else " · 공개 링크 모드"
         self.count_lbl.setText(f"파일 {len(files):,}개{mode}")
         self._recalc_folder_sizes()
+        self._apply_sort()
         self.grid.set_root(top)
         self._update_summary()
         self._apply_filter(self.filter.text())
@@ -480,8 +598,12 @@ class MainWindow(QMainWindow):
                 self._set_view(1)
 
     def _make_item(self, it: DriveItem, parent: QTreeWidgetItem | None) -> QTreeWidgetItem:
-        q = QTreeWidgetItem(parent) if parent is not None else QTreeWidgetItem()
+        q = FileItem(parent) if parent is not None else FileItem()
         q.setText(0, it.name)
+        if it.modified:
+            q.setText(4, it.modified[:10])
+            q.setForeground(4, QColor(style.MUTED))
+            q.setTextAlignment(4, Qt.AlignCenter)
         q.setData(0, ITEM_ROLE, it)
         q.setTextAlignment(2, Qt.AlignRight | Qt.AlignVCenter)
         q.setTextAlignment(3, Qt.AlignCenter)
@@ -522,6 +644,7 @@ class MainWindow(QMainWindow):
             if not it.is_folder:
                 return it.size or 0
             total = sum(rec(q.child(i)) for i in range(q.childCount()))
+            it._tot = total
             q.setText(2, fmt_size(total) if total else "-")
             return total
 
@@ -529,6 +652,10 @@ class MainWindow(QMainWindow):
         for i in range(self.tree.topLevelItemCount()):
             rec(self.tree.topLevelItem(i))
         self.tree.blockSignals(False)
+        if self.s.sort_key == "size" and self.tree.isSortingEnabled():
+            # 공개 링크 모드는 용량이 나중에 채워지므로 다시 정렬
+            self.tree.sortItems(self.tree.sortColumn(), self.tree.header().sortIndicatorOrder())
+            self.grid.refresh_checks(True)
 
     # ================================================================ 선택
     def _iter_file_items(self):
@@ -600,6 +727,40 @@ class MainWindow(QMainWindow):
         elif act == a4:
             self.tree.collapseAll()
 
+    def _apply_sort(self, save: bool = False):
+        key = self.sort_combo.currentData() or "name"
+        desc = self.s.sort_desc
+        self.sort_dir.setIcon(make_icon("desc" if desc else "asc"))
+        self.sort_dir.setToolTip("내림차순" if desc else "오름차순")
+        order = Qt.DescendingOrder if desc else Qt.AscendingOrder
+        hh = self.tree.header()
+        hh.blockSignals(True)
+        self.tree.setSortingEnabled(True)
+        self.tree.sortItems(SORT_COLS[key], order)
+        hh.setSortIndicator(SORT_COLS[key], order)
+        hh.blockSignals(False)
+        self.grid.set_sort(key, desc)
+        if save:
+            self.s.sort_key = key
+            self.s.save()
+
+    def _flip_sort(self):
+        self.s.sort_desc = not self.s.sort_desc
+        self._apply_sort(save=True)
+
+    def _on_tree_sort_clicked(self, col: int, order):
+        key = COL_KEYS.get(col, "name")
+        self.s.sort_desc = order == Qt.DescendingOrder
+        if key in dict(SORT_KEYS):
+            i = [k for k, _ in SORT_KEYS].index(key)
+            self.sort_combo.blockSignals(True)
+            self.sort_combo.setCurrentIndex(i)
+            self.sort_combo.blockSignals(False)
+            self.s.sort_key = key
+        self.sort_dir.setIcon(make_icon("desc" if self.s.sort_desc else "asc"))
+        self.grid.set_sort(key if key in dict(SORT_KEYS) else "name", self.s.sort_desc)
+        self.s.save()
+
     def _set_view(self, i: int):
         self.view_group.button(i).setChecked(True)
         if self.view_stack.currentIndex() != i:
@@ -669,23 +830,37 @@ class MainWindow(QMainWindow):
         for t in tasks:
             q = self._dl_rows.get(t.uid)
             if q is None:
-                q = QTreeWidgetItem([t.name, "", "", "", "", ""])
+                q = DlItem([t.name, "", "", "", "", "", ""])
                 q.setData(0, ITEM_ROLE, t.uid)
+                q.setData(0, SORT_ROLE, None)
                 q.setTextAlignment(1, Qt.AlignRight | Qt.AlignVCenter)
                 q.setTextAlignment(3, Qt.AlignRight | Qt.AlignVCenter)
                 q.setTextAlignment(4, Qt.AlignRight | Qt.AlignVCenter)
                 self.dl.addTopLevelItem(q)
                 self._dl_rows[t.uid] = q
+                acts = RowActions(t.uid)
+                acts.clicked.connect(self._row_action)
+                self.dl.setItemWidget(q, 6, acts)
             prog = (t.done_bytes / t.size) if t.size else (1.0 if t.status in ("done", "skipped") else 0.0)
             if t.status == "verifying" and t.size:
                 prog = t.verify_bytes / t.size
             q.setData(2, PROGRESS_ROLE, prog)
             q.setData(2, STATUS_ROLE, t.status)
+            q.setData(1, SORT_ROLE, t.size or 0)
+            q.setData(2, SORT_ROLE, round(prog, 3))
+            q.setData(3, SORT_ROLE, round(t.speed / 1e5))
+            q.setData(5, SORT_ROLE, ["downloading", "starting", "verifying", "waiting", "queued", "paused",
+                                     "error", "canceled", "done", "skipped"].index(t.status)
+                      if t.status in STATUS_LABEL else 99)
+            w = self.dl.itemWidget(q, 6)
+            if isinstance(w, RowActions):
+                w.set_status(t.status)
             q.setText(1, fmt_size(t.size))
             running = t.status in ("downloading", "starting", "verifying")
             q.setText(3, fmt_speed(t.speed) if running else "")
             eta = ((t.size - t.done_bytes) / t.speed) if (running and t.size and t.speed > 1) else None
             q.setText(4, fmt_eta(eta))
+            q.setData(4, SORT_ROLE, int(eta) if eta else 10 ** 9)
             label = STATUS_LABEL.get(t.status, t.status)
             if t.status == "downloading" and t.connections:
                 label = f"{label} · {t.connections}연결"
@@ -697,6 +872,7 @@ class MainWindow(QMainWindow):
                 label = f"구글 제한 · {left}분 후 재시도"
             q.setText(5, label)
             color = {"done": style.OK, "skipped": style.OK, "error": style.ERR, "waiting": style.WARN,
+                     "canceled": style.MUTED,
                      "paused": style.MUTED, "queued": style.MUTED}.get(t.status, style.TEXT)
             q.setForeground(5, QColor(color))
             tip = t.dest + (f"\n{t.error}" if t.error else "") + (f"\n{t.note}" if t.note else "")
@@ -731,19 +907,76 @@ class MainWindow(QMainWindow):
         m = QMenu(self)
         a_pause = m.addAction("일시정지")
         a_resume = m.addAction("재개 / 다시 시도")
+        a_cancel = m.addAction("취소 (받던 임시 파일 삭제)")
         a_open = m.addAction("폴더 열기")
         m.addSeparator()
-        a_rm = m.addAction("목록에서 제거 (받던 파일 삭제)")
+        a_rm = m.addAction("목록에서 삭제")
         act = m.exec(self.dl.viewport().mapToGlobal(pos))
         mgr = self.svc.manager
         if act == a_pause:
             mgr.pause(uids)
         elif act == a_resume:
             mgr.resume(uids)
+        elif act == a_cancel:
+            if self._confirm_discard(uids, "취소"):
+                mgr.cancel(uids)
         elif act == a_open:
             self._open_folder(uids)
         elif act == a_rm:
-            mgr.remove(uids)
+            if self._confirm_discard(uids, "삭제"):
+                mgr.remove(uids)
+        self._refresh_downloads()
+
+    def _row_action(self, action: str, uid: str):
+        mgr = self.svc.manager
+        t = mgr.get(uid)
+        if not t:
+            return
+        if action == "toggle":
+            if t.status in RUNNING or t.status in ("queued", "waiting"):
+                mgr.pause([uid])
+            elif t.status in ("done", "skipped"):
+                self._open_folder([uid])
+            else:
+                mgr.resume([uid])
+        elif action == "cancel":
+            if self._confirm_discard([uid], "취소"):
+                mgr.cancel([uid])
+        elif action == "delete":
+            if self._confirm_discard([uid], "삭제"):
+                mgr.remove([uid])
+        self._refresh_downloads()
+
+    def _confirm_discard(self, uids, verb: str) -> bool:
+        """1GB 넘게 받은 걸 버릴 땐 한 번 확인."""
+        ts = [t for u in uids if (t := self.svc.manager.get(u)) and t.status in UNFINISHED]
+        got = sum(t.done_bytes for t in ts)
+        if got < 1024 ** 3:
+            return True
+        r = QMessageBox.question(
+            self, f"다운로드 {verb}",
+            f"{len(ts)}개 파일에서 받은 {fmt_size(got)}가 삭제되고 다시 받으려면 처음부터 받아야 해요.\n{verb}할까요?")
+        return r == QMessageBox.Yes
+
+    def _ask_leftovers(self):
+        """이전 실행에서 남은 임시 파일: 이어받을지 지울지."""
+        left = self.svc.manager.partial_tasks()
+        if not left:
+            return
+        got = sum(t.done_bytes for t in left)
+        box = QMessageBox(self)
+        box.setWindowTitle("받다 만 파일")
+        box.setText(f"이전에 받다 만 파일 {len(left)}개가 있어요 (받은 양 {fmt_size(got)}).")
+        keep = box.addButton("이어받기", QMessageBox.AcceptRole)
+        drop = box.addButton("임시 파일 삭제", QMessageBox.DestructiveRole)
+        box.setDefaultButton(keep)
+        box.exec()
+        if box.clickedButton() is drop:
+            n = self.svc.manager.discard_unfinished()
+            self._toast(f"받다 만 파일 {n}개를 정리했어요")
+        else:
+            self.svc.manager.resume([t.uid for t in left])
+            self._switch_page(1)
         self._refresh_downloads()
 
     def _open_folder(self, uids):
@@ -765,7 +998,27 @@ class MainWindow(QMainWindow):
 
     # ================================================================ 종료
     def closeEvent(self, e):
-        if any(t.status in ("downloading", "starting", "verifying") for t in self.svc.manager.snapshot()):
+        mgr = self.svc.manager
+        tasks = mgr.snapshot()
+        active = [t for t in tasks if t.status in RUNNING]
+        unfinished = [t for t in tasks if t.status in UNFINISHED]
+        discard = False
+        if unfinished and self.s.cleanup_on_exit:
+            got = sum(t.done_bytes for t in unfinished)
+            box = QMessageBox(self)
+            box.setWindowTitle("종료")
+            box.setText(f"다 받지 못한 파일이 {len(unfinished)}개 있어요 (받은 양 {fmt_size(got)}).\n"
+                        "종료하면서 임시 파일을 삭제할까요?")
+            b_del = box.addButton("삭제하고 종료", QMessageBox.DestructiveRole)
+            b_keep = box.addButton("남겨두고 종료 (다음에 이어받기)", QMessageBox.AcceptRole)
+            box.addButton("취소", QMessageBox.RejectRole)
+            box.setDefaultButton(b_del)
+            box.exec()
+            if box.clickedButton() not in (b_del, b_keep):
+                e.ignore()
+                return
+            discard = box.clickedButton() is b_del
+        elif active:
             r = QMessageBox.question(
                 self, "다운로드 중",
                 "받고 있는 파일이 있어요. 종료하면 일시정지되고, 다음에 실행하면 이어받을 수 있어요.\n종료할까요?")
@@ -778,7 +1031,9 @@ class MainWindow(QMainWindow):
         if self._cancel:
             self._cancel.set()
         self.loader.shutdown()
-        self.svc.shutdown()
+        self.svc.shutdown()   # 받던 연결을 모두 멈추고 파일을 닫은 뒤
+        if discard:
+            mgr.discard_unfinished()
         e.accept()
 
     def sizeHint(self):

@@ -44,6 +44,9 @@ class SettingsDialog(QDialog):
         self.quota = QCheckBox("할당량 초과 파일은 내 드라이브에 임시 사본을 만들어 받기")
         self.quota.setChecked(settings.quota_copy_fallback)
         lay.addWidget(self.quota)
+        self.cleanup = QCheckBox("종료할 때 받다 만 파일의 임시 파일 정리 여부 묻기 (끄면 항상 남겨서 이어받기)")
+        self.cleanup.setChecked(settings.cleanup_on_exit)
+        lay.addWidget(self.cleanup)
 
         t2 = QLabel("구글 연결")
         t2.setObjectName("sectionTitle")
@@ -101,6 +104,7 @@ class SettingsDialog(QDialog):
     def _save(self):
         self.s.connections_per_file = self.conns.value()
         self.s.auto_connections = self.auto.isChecked()
+        self.s.cleanup_on_exit = self.cleanup.isChecked()
         self.s.concurrent_files = self.files.value()
         self.s.verify_md5 = self.md5.isChecked()
         self.s.quota_copy_fallback = self.quota.isChecked()

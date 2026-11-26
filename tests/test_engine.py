@@ -247,3 +247,36 @@ def test_verify_frees_slot(server, tmp_path, monkeypatch):
         time.sleep(0.1)
     assert a.status == b.status == "done"
     m.shutdown()
+
+
+def test_cancel_and_discard(server, tmp_path):
+    Handler.delay, Handler.fail_every = 0.05, 0
+    m = DownloadManager(S(), lambda t: FakeSource(server), tmp_path / "q.json")
+    a = Task(name="a.bin", dest=str(tmp_path / "a.bin"), source={"id": "a"}, size=SIZE)
+    b = Task(name="b.bin", dest=str(tmp_path / "b.bin"), source={"id": "b"}, size=SIZE)
+    m.add([a, b])
+    deadline = time.time() + 20
+    while time.time() < deadline and not (a.done_bytes > 0 and b.done_bytes > 0):
+        time.sleep(0.1)
+    # 받는 도중 취소 → 임시 파일 삭제, 목록엔 '취소됨'
+    m.cancel([a.uid])
+    while time.time() < deadline and a.status != "canceled":
+        time.sleep(0.05)
+    assert a.status == "canceled" and a.done_bytes == 0
+    assert not os.path.exists(a.part_path) and not os.path.exists(a.state_path)
+    # 종료 시 정리: 멈춘 뒤 미완료 작업의 임시 파일 삭제, 목록에서 제거
+    m.shutdown()
+    assert b.status == "paused" and os.path.exists(b.part_path)
+    assert m.partial_tasks() == [b]
+    assert m.discard_unfinished() == 1
+    assert not os.path.exists(b.part_path) and not os.path.exists(b.state_path)
+    assert [t.status for t in m.snapshot()] == ["canceled"]
+    Handler.delay = 0
+    # 취소된 건 다시 받으면 처음부터
+    m2 = DownloadManager(S(), lambda t: FakeSource(server), tmp_path / "q2.json")
+    m2.add([a])
+    m2.resume([a.uid])
+    while time.time() < deadline + 20 and a.status != "done":
+        time.sleep(0.1)
+    assert a.status == "done"
+    m2.shutdown()

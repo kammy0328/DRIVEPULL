@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QHBoxLayout, QLabel, QListWidg
                                QVBoxLayout, QWidget)
 
 from . import style
-from .widgets import fmt_size
+from .widgets import fmt_size, natural_key
 
 TREE_ROLE = Qt.UserRole + 20
 ITEM_ROLE = Qt.UserRole + 1   # main_window 과 같은 값 (트리 항목의 DriveItem)
@@ -55,6 +55,19 @@ def info_text(it) -> str:
     if it.duration_ms:
         parts.append(fmt_dur(it.duration_ms))
     return " · ".join(parts)
+
+
+def sort_value(it, key: str):
+    """정렬 기준값. 폴더 크기는 _recalc_folder_sizes 가 계산해 둔 _tot 사용."""
+    if key == "size":
+        return getattr(it, "_tot", 0) if it.is_folder else (it.size or 0)
+    if key == "type":
+        return ("" if it.is_folder else os.path.splitext(it.name)[1].lower(), natural_key(it.name))
+    if key == "modified":
+        return it.modified or ""
+    if key == "info":
+        return (it.duration_ms, it.width * it.height)
+    return natural_key(it.name)
 
 
 class CardDelegate(QStyledItemDelegate):
@@ -259,6 +272,8 @@ class ThumbGrid(QWidget):
         self.root: QTreeWidgetItem | None = None
         self.current: QTreeWidgetItem | None = None
         self.filter_text = ""
+        self.sort_key = "name"
+        self.sort_desc = False
         self._meta: dict[int, str] = {}
         self._preview: dict[int, object] = {}
         self.eff_w = self.card_w
@@ -370,9 +385,21 @@ class ThumbGrid(QWidget):
                         stack.append(c)
                     elif self.filter_text in ci.name.lower():
                         out.append(c)
-            return out
-        kids = [q.child(i) for i in range(q.childCount())]
-        return sorted(kids, key=lambda c: 0 if c.data(0, ITEM_ROLE).is_folder else 1)
+            return self._sorted(out)
+        return self._sorted([q.child(i) for i in range(q.childCount())])
+
+    def _sorted(self, items):
+        def key(c):
+            return sort_value(c.data(0, ITEM_ROLE), self.sort_key)
+        folders = sorted([c for c in items if c.data(0, ITEM_ROLE).is_folder], key=key, reverse=self.sort_desc)
+        files = sorted([c for c in items if not c.data(0, ITEM_ROLE).is_folder], key=key, reverse=self.sort_desc)
+        return folders + files
+
+    def set_sort(self, key: str, desc: bool):
+        if (key, desc) != (self.sort_key, self.sort_desc):
+            self.sort_key, self.sort_desc = key, desc
+            if self.current is not None:
+                self._rebuild()
 
     def _rebuild(self):
         self.view.clear()

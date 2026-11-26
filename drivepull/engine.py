@@ -249,7 +249,9 @@ STATUS_LABEL = {
     "skipped": "이미 있음",
     "error": "오류",
     "waiting": "구글 제한 대기",
+    "canceled": "취소됨",
 }
+UNFINISHED = ("queued", "starting", "downloading", "paused", "verifying", "error", "waiting")
 LIMIT_WAITS = (10, 30, 60, 120)   # 구글 제한 시 재시도 대기(분)
 
 
@@ -818,7 +820,9 @@ class DownloadManager:
         with self.lock:
             for uid in uids:
                 t = self.get(uid)
-                if t and t.status in ("paused", "error", "waiting"):
+                if t and t.status in ("paused", "error", "waiting", "canceled"):
+                    if t.status == "canceled":
+                        t.done_bytes = 0
                     t.status = "queued"
                     t.error = ""
                     t.retry_at = 0.0
@@ -843,9 +847,43 @@ class DownloadManager:
                         self.tasks.remove(t)
             self._dirty = True
 
+    def cancel(self, uids) -> None:
+        """받기를 멈추고 임시 파일을 지운다. 목록에는 '취소됨'으로 남아서 다시 받을 수 있다."""
+        with self.lock:
+            for uid in uids:
+                t = self.get(uid)
+                if not t or t.status in ("done", "skipped", "canceled"):
+                    continue
+                if uid in self._running:
+                    self._want[uid] = "cancel"
+                    self._running[uid][1].set()
+                else:
+                    self._delete_partial(t)
+                    t.status = "canceled"
+                    t.done_bytes = 0
+                    t.retry_at = 0.0
+            self._dirty = True
+
+    def partial_tasks(self) -> list[Task]:
+        """임시 파일(.drivepull)이 남아 있는 미완료 작업."""
+        with self.lock:
+            return [t for t in self.tasks if t.status in UNFINISHED
+                    and (os.path.exists(fs_path(t.part_path)) or os.path.exists(fs_path(t.state_path)))]
+
+    def discard_unfinished(self) -> int:
+        """미완료 작업의 임시 파일을 지우고 목록에서 뺀다 (종료 시 정리). 지운 개수."""
+        with self.lock:
+            todo = [t for t in self.tasks if t.status in UNFINISHED and t.uid not in self._running]
+            for t in todo:
+                self._delete_partial(t)
+                self.tasks.remove(t)
+            self._dirty = True
+        self.save_queue()
+        return len(todo)
+
     def clear_finished(self) -> None:
         with self.lock:
-            self.tasks = [t for t in self.tasks if t.status not in ("done", "skipped")]
+            self.tasks = [t for t in self.tasks if t.status not in ("done", "skipped", "canceled")]
             self._dirty = True
 
     def pause_all(self) -> None:
@@ -871,10 +909,14 @@ class DownloadManager:
     @staticmethod
     def _delete_partial(t: Task) -> None:
         for p in (t.part_path, t.state_path, t.state_path + ".tmp"):
-            try:
-                os.remove(fs_path(p))
-            except OSError:
-                pass
+            for attempt in range(5):   # Windows는 방금 닫은 파일이 잠깐 잠겨 있을 수 있음
+                try:
+                    os.remove(fs_path(p))
+                    break
+                except FileNotFoundError:
+                    break
+                except OSError:
+                    time.sleep(0.2)
 
     # ---- 저장/복원
     def save_queue(self) -> None:
@@ -1015,9 +1057,15 @@ class DownloadManager:
                 t.speed = 0.0
                 t.connections = 0
                 if want == "remove":
-                    self._delete_partial(t)
+                    if not result:
+                        self._delete_partial(t)
                     if t in self.tasks:
                         self.tasks.remove(t)
+                elif want == "cancel" and not result:
+                    self._delete_partial(t)
+                    t.status = "canceled"
+                    t.done_bytes = 0
+                    t.error = ""
                 elif limited is not None and want != "pause":
                     # 받은 부분은 그대로 두고 기다렸다가 자동으로 이어받기
                     wait_min = LIMIT_WAITS[min(t.limit_hits, len(LIMIT_WAITS) - 1)]

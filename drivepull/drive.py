@@ -18,7 +18,7 @@ USERCONTENT = "https://drive.usercontent.google.com/download"
 FOLDER_MIME = "application/vnd.google-apps.folder"
 SHORTCUT_MIME = "application/vnd.google-apps.shortcut"
 TIMEOUT = (15, 60)
-FIELDS = ("id,name,mimeType,size,md5Checksum,resourceKey,shortcutDetails,thumbnailLink,"
+FIELDS = ("id,name,mimeType,size,md5Checksum,resourceKey,shortcutDetails,thumbnailLink,modifiedTime,"
           "videoMediaMetadata(width,height,durationMillis),imageMediaMetadata(width,height)")
 
 # 구글 문서류는 오피스 파일로 내보낸다
@@ -88,6 +88,7 @@ class DriveItem:
     width: int = 0
     height: int = 0
     duration_ms: int = 0
+    modified: str = ""   # ISO 시각 (API 모드만)
 
     def walk_files(self):
         if self.is_folder:
@@ -262,6 +263,7 @@ def _item_from_meta(m: dict) -> DriveItem:
     if m.get("thumbnailLink"):
         # 기본 220px 썸네일 주소의 크기 부분만 바꿔서 큰 이미지로 받는다
         it.thumb_url = re.sub(r"=s\d+$", "=s640", m["thumbnailLink"])
+    it.modified = m.get("modifiedTime", "")
     md = m.get("videoMediaMetadata") or m.get("imageMediaMetadata") or {}
     it.width = int(md.get("width") or 0)
     it.height = int(md.get("height") or 0)

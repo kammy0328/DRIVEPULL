@@ -9,7 +9,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 APP_NAME = "DRIVEPULL"
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.5.0"
 
 
 def app_dir() -> Path:
@@ -38,6 +38,9 @@ class Settings:
     verify_md5: bool = True
     quota_copy_fallback: bool = True
     keep_folder_structure: bool = True
+    cleanup_on_exit: bool = True     # 종료 시 받다 만 파일 정리
+    sort_key: str = "name"           # name | size | type | modified
+    sort_desc: bool = False
     api_key: str = ""
     last_save_dir: str = ""
     window_geometry: str = ""

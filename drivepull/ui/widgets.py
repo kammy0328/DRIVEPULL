@@ -129,3 +129,81 @@ class FadeIn:
     def play(self):
         self.anim.stop()
         self.anim.start()
+
+
+# ---------------------------------------------------------------- 아이콘 (글꼴에 의존하지 않게 직접 그림)
+def make_icon(kind: str, color: str = "#c9ced8", size: int = 16):
+    from PySide6.QtCore import QPointF
+    from PySide6.QtGui import QIcon, QPainterPath, QPixmap
+    pm = QPixmap(size * 2, size * 2)   # 고해상도 화면 대응
+    pm.setDevicePixelRatio(2.0)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    c = QColor(color)
+    s = float(size)
+    pen = QPen(c, 1.8)
+    pen.setCapStyle(Qt.RoundCap)
+    pen.setJoinStyle(Qt.RoundJoin)
+    if kind == "pause":
+        p.setPen(Qt.NoPen)
+        p.setBrush(c)
+        p.drawRoundedRect(QRectF(s * 0.25, s * 0.2, s * 0.17, s * 0.6), 1.5, 1.5)
+        p.drawRoundedRect(QRectF(s * 0.58, s * 0.2, s * 0.17, s * 0.6), 1.5, 1.5)
+    elif kind == "play":
+        path = QPainterPath(QPointF(s * 0.3, s * 0.18))
+        path.lineTo(s * 0.3, s * 0.82)
+        path.lineTo(s * 0.82, s * 0.5)
+        path.closeSubpath()
+        p.setPen(QPen(c, 1.2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        p.setBrush(c)
+        p.drawPath(path)
+    elif kind == "retry":
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+        p.drawArc(QRectF(s * 0.2, s * 0.2, s * 0.6, s * 0.6), 60 * 16, 290 * 16)
+        path = QPainterPath(QPointF(s * 0.62, s * 0.1))
+        path.lineTo(s * 0.78, s * 0.27)
+        path.lineTo(s * 0.56, s * 0.34)
+        p.drawPath(path)
+    elif kind == "cancel":
+        p.setPen(pen)
+        p.drawLine(QPointF(s * 0.27, s * 0.27), QPointF(s * 0.73, s * 0.73))
+        p.drawLine(QPointF(s * 0.73, s * 0.27), QPointF(s * 0.27, s * 0.73))
+    elif kind == "trash":
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+        p.drawLine(QPointF(s * 0.18, s * 0.28), QPointF(s * 0.82, s * 0.28))
+        p.drawLine(QPointF(s * 0.4, s * 0.16), QPointF(s * 0.6, s * 0.16))
+        p.drawRoundedRect(QRectF(s * 0.27, s * 0.28, s * 0.46, s * 0.56), 2, 2)
+        p.drawLine(QPointF(s * 0.43, s * 0.42), QPointF(s * 0.43, s * 0.72))
+        p.drawLine(QPointF(s * 0.57, s * 0.42), QPointF(s * 0.57, s * 0.72))
+    elif kind == "folder":
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+        path = QPainterPath(QPointF(s * 0.15, s * 0.3))
+        path.lineTo(s * 0.15, s * 0.8)
+        path.lineTo(s * 0.85, s * 0.8)
+        path.lineTo(s * 0.85, s * 0.38)
+        path.lineTo(s * 0.5, s * 0.38)
+        path.lineTo(s * 0.42, s * 0.25)
+        path.lineTo(s * 0.15, s * 0.25)
+        path.closeSubpath()
+        p.drawPath(path)
+    elif kind in ("asc", "desc"):
+        p.setPen(pen)
+        y1, y2 = (s * 0.2, s * 0.8) if kind == "asc" else (s * 0.8, s * 0.2)
+        p.drawLine(QPointF(s * 0.5, y1), QPointF(s * 0.5, y2))
+        p.drawLine(QPointF(s * 0.5, y1), QPointF(s * 0.3, y1 + (s * 0.22 if kind == "asc" else -s * 0.22)))
+        p.drawLine(QPointF(s * 0.5, y1), QPointF(s * 0.7, y1 + (s * 0.22 if kind == "asc" else -s * 0.22)))
+    p.end()
+    return QIcon(pm)
+
+
+# ---------------------------------------------------------------- 정렬
+_NUM = __import__("re").compile(r"(\d+)")
+
+
+def natural_key(name: str):
+    """A2 < A10 처럼 숫자를 숫자로 비교 (클립 이름 A001_C002 정렬용)."""
+    return [int(x) if x.isdigit() else x.lower() for x in _NUM.split(name)]

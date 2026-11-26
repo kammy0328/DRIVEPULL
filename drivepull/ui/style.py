@@ -73,6 +73,13 @@ QCheckBox {{ spacing: 8px; }}
 QCheckBox::indicator {{ width: 16px; height: 16px; border-radius: 4px; border: 1px solid #3a404b; background: {PANEL2}; }}
 QCheckBox::indicator:checked {{ background: {ACCENT}; border-color: {ACCENT}; image: url("{check_svg}"); }}
 
+QToolButton {{ background: transparent; border: none; border-radius: 6px; padding: 3px; }}
+QToolButton:hover {{ background: #262c38; }}
+QToolButton:pressed {{ background: #1c2230; }}
+QComboBox {{ background: {PANEL2}; border: 1px solid {BORDER}; border-radius: 8px; padding: 6px 10px; }}
+QComboBox:hover {{ border-color: #3a404b; }}
+QComboBox::drop-down {{ border: none; width: 18px; }}
+QComboBox QAbstractItemView {{ background: {PANEL2}; border: 1px solid {BORDER}; selection-background-color: #262c38; }}
 QSpinBox {{ background: {PANEL2}; border: 1px solid {BORDER}; border-radius: 8px; padding: 6px 8px; }}
 QScrollBar:vertical {{ background: transparent; width: 10px; margin: 4px 2px; }}
 QScrollBar::handle:vertical {{ background: #2e333c; border-radius: 3px; min-height: 30px; }}
