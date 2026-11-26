@@ -2,13 +2,11 @@
 import hashlib
 import os
 import random
-import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
-import requests
 
 from drivepull.engine import (DownloadError, DownloadManager, ProbeResult, SegmentedDownload,
                               Task, TransientError)
