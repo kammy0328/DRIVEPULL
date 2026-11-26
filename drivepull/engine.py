@@ -124,6 +124,59 @@ def preallocate(path: str, size: int) -> bool:
         return True
 
 
+HDD_MAX_CONNS = 4
+_disk_cache: dict[str, Optional[bool]] = {}
+
+
+def disk_is_hdd(path: str) -> Optional[bool]:
+    """저장 위치가 HDD(탐색 지연 있는 디스크)면 True, SSD면 False, 모르면 None (네트워크 드라이브 등).
+
+    Windows IOCTL_STORAGE_QUERY_PROPERTY / StorageDeviceSeekPenaltyProperty 사용 (관리자 권한 불필요).
+    """
+    if sys.platform != "win32":
+        return None
+    drive = os.path.splitdrive(os.path.abspath(path))[0]
+    if not drive or drive.startswith("\\\\"):
+        return None
+    key = drive.upper()
+    if key in _disk_cache:
+        return _disk_cache[key]
+    result: Optional[bool] = None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.windll.kernel32
+        k32.CreateFileW.restype = wintypes.HANDLE
+        k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                                    wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        k32.DeviceIoControl.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+                                        ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+                                        ctypes.c_void_p]
+        k32.DeviceIoControl.restype = wintypes.BOOL
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        h = k32.CreateFileW(f"\\\\.\\{drive}", 0, 3, None, 3, 0, None)  # 접근 0, 읽기·쓰기 공유, OPEN_EXISTING
+        if h and h != wintypes.HANDLE(-1).value:
+            class Query(ctypes.Structure):
+                _fields_ = [("PropertyId", wintypes.DWORD), ("QueryType", wintypes.DWORD),
+                            ("AdditionalParameters", ctypes.c_ubyte * 1)]
+
+            class SeekPenalty(ctypes.Structure):
+                _fields_ = [("Version", wintypes.DWORD), ("Size", wintypes.DWORD),
+                            ("IncursSeekPenalty", wintypes.BOOLEAN)]
+
+            q = Query(7, 0)   # StorageDeviceSeekPenaltyProperty, PropertyStandardQuery
+            out = SeekPenalty()
+            ret = wintypes.DWORD(0)
+            if k32.DeviceIoControl(h, 0x2D1400, ctypes.byref(q), ctypes.sizeof(q),
+                                   ctypes.byref(out), ctypes.sizeof(out), ctypes.byref(ret), None):
+                result = bool(out.IncursSeekPenalty)
+            k32.CloseHandle(h)
+    except Exception:  # noqa: BLE001
+        result = None
+    _disk_cache[key] = result
+    return result
+
+
 def _range_total(cr: str) -> Optional[int]:
     import re
     m = re.match(r"bytes \d+-\d+/(\d+)", cr or "")
@@ -177,7 +230,9 @@ STATUS_LABEL = {
     "done": "완료",
     "skipped": "이미 있음",
     "error": "오류",
+    "waiting": "구글 제한 대기",
 }
+LIMIT_WAITS = (10, 30, 60, 120)   # 구글 제한 시 재시도 대기(분)
 
 
 @dataclass
@@ -192,12 +247,15 @@ class Task:
     done_bytes: int = 0
     error: str = ""
     note: str = ""
+    retry_at: float = 0.0     # 구글 제한 대기 후 자동 재시도 시각 (epoch)
+    limit_hits: int = 0
     # 런타임 전용
     speed: float = 0.0
     connections: int = 0
+    verify_bytes: int = 0
 
     PERSIST = ("name", "dest", "source", "size", "md5", "uid", "status",
-               "done_bytes", "error", "note")
+               "done_bytes", "error", "note", "retry_at", "limit_hits")
 
     def to_dict(self) -> dict:
         return {k: getattr(self, k) for k in self.PERSIST}
@@ -239,7 +297,13 @@ class SegmentedDownload:
                  auto: bool = False, start: int | None = None):
         self.task = task
         self.source = source
-        self.connections = max(1, connections)        # 최대 연결 수
+        self.connections = max(1, min(connections, getattr(source, "max_connections", connections)))
+        self.min_split = getattr(source, "min_split", MIN_SPLIT)
+        self.hdd = disk_is_hdd(task.dest) is True
+        if self.hdd and self.connections > HDD_MAX_CONNS:
+            # HDD에 여러 위치를 동시에 쓰면 헤드가 왔다 갔다 해서 오히려 느려짐
+            self.connections = HDD_MAX_CONNS
+            task.note = f"HDD 감지: 연결 {HDD_MAX_CONNS}개로 제한"
         self.auto = auto
         self.target = min(self.connections, max(1, start or AUTO_START)) if auto else self.connections
         self.best_target = self.target
@@ -263,6 +327,7 @@ class SegmentedDownload:
         self._single_done = 0
         self.skipped = False
         self._prefetch = None   # (구간, 시작 위치, 응답): 첫 요청 응답을 첫 구간에 그대로 사용
+        self.manager_wake: Callable[[], None] = lambda: None
 
     # ---- 진행률
     def done_bytes(self) -> int:
@@ -315,7 +380,7 @@ class SegmentedDownload:
                     return s
             # 남은 게 가장 큰 활성 구간을 반으로 쪼개서 가져온다
             best = max((s for s in self.segs if s.active), key=lambda s: s.remaining, default=None)
-            if best is None or best.remaining < 2 * MIN_SPLIT:
+            if best is None or best.remaining < 2 * self.min_split:
                 return None
             mid = best.pos + best.remaining // 2
             new = _Seg(mid, best.end)
@@ -522,7 +587,7 @@ class SegmentedDownload:
             self._clear_state()
             if not preallocate(t.part_path, size):
                 t.note = "이 드라이브(exFAT 등)는 sparse 파일을 지원하지 않아 초반 속도가 느릴 수 있음"
-            n = max(1, min(self.connections, size // MIN_SPLIT or 1))
+            n = max(1, min(self.connections, size // self.min_split or 1))
             step = size // n
             self.segs = []
             for i in range(n):
@@ -618,7 +683,7 @@ class SegmentedDownload:
         if rate >= self._best_rate * 0.95:
             self._best_rate = max(self._best_rate, rate)
             self.best_target = self.target
-        possible = max(1, self._remaining() // MIN_SPLIT)
+        possible = max(1, self._remaining() // self.min_split)
         cap = min(self.connections, possible)
         if now >= self._plateau_until and self.target < cap and self.active_workers >= self.target:
             step = self.target if self._fast else (2 if self.target < 8 else 4)
@@ -648,8 +713,10 @@ class SegmentedDownload:
         t = self.task
         if t.md5 and t.source.get("verify", True):
             self.status_cb("verifying")
+            self.manager_wake()
             vstop = self.stop
-            got = md5_file(t.part_path, stop=vstop)
+            t.verify_bytes = 0
+            got = md5_file(t.part_path, progress=lambda n: setattr(t, "verify_bytes", n), stop=vstop)
             if got is None:
                 return False
             if got.lower() != t.md5.lower():
@@ -725,7 +792,7 @@ class DownloadManager:
                 if uid in self._running:
                     self._want[uid] = "pause"
                     self._running[uid][1].set()
-                elif t.status == "queued":
+                elif t.status in ("queued", "waiting"):
                     t.status = "paused"
             self._dirty = True
 
@@ -733,9 +800,10 @@ class DownloadManager:
         with self.lock:
             for uid in uids:
                 t = self.get(uid)
-                if t and t.status in ("paused", "error"):
+                if t and t.status in ("paused", "error", "waiting"):
                     t.status = "queued"
                     t.error = ""
+                    t.retry_at = 0.0
             self._dirty = True
         self._wake.set()
 
@@ -768,7 +836,7 @@ class DownloadManager:
 
     def resume_all(self) -> None:
         with self.lock:
-            self.resume([t.uid for t in self.tasks if t.status in ("paused", "error")])
+            self.resume([t.uid for t in self.tasks if t.status in ("paused", "error", "waiting")])
 
     def snapshot(self) -> list[Task]:
         with self.lock:
@@ -834,10 +902,20 @@ class DownloadManager:
                 break
             now = time.monotonic()
             with self.lock:
+                wall = time.time()
+                for t in self.tasks:
+                    if t.status == "waiting" and t.retry_at and wall >= t.retry_at:
+                        t.status = "queued"
+                        t.retry_at = 0.0
+                        self._dirty = True
                 limit = max(1, int(self.settings.concurrent_files))
-                if len(self._running) < limit:
+
+                def busy() -> int:
+                    # MD5 검증 중인 파일은 다운로드 칸을 차지하지 않음 → 검증하는 동안 다음 파일 시작
+                    return sum(1 for u in self._running if (x := self.get(u)) and x.status != "verifying")
+                if busy() < limit:
                     for t in self.tasks:
-                        if len(self._running) >= limit:
+                        if busy() >= limit:
                             break
                         if t.status == "queued" and t.uid not in self._running:
                             self._start(t)
@@ -875,6 +953,7 @@ class DownloadManager:
 
         result: Optional[bool] = None
         err: Optional[BaseException] = None
+        limited: Optional[BaseException] = None
         try:
             src = self.source_factory(t)
             t.source["verify"] = bool(self.settings.verify_md5)
@@ -882,6 +961,7 @@ class DownloadManager:
                 auto = bool(getattr(self.settings, "auto_connections", False))
                 dl = SegmentedDownload(t, src, int(self.settings.connections_per_file), stop, set_status,
                                        auto=auto, start=self.learned)
+                dl.manager_wake = self._wake.set
                 holder[0] = dl
                 holder[1] = 0
                 try:
@@ -890,12 +970,19 @@ class DownloadManager:
                 except QuotaExceeded as qe:
                     if self.quota_handler and self.settings.quota_copy_fallback \
                             and not t.source.get("copied_from"):
-                        t.status = "starting"
-                        t.note = "할당량 초과 → 내 드라이브로 복사 후 받는 중"
-                        src = self.quota_handler(t, qe)  # 실패하면 예외
-                        continue
-                    raise
-            t.done_bytes = dl.done_bytes() if result is not None else t.done_bytes
+                        try:
+                            new_src = self.quota_handler(t, qe)
+                        except DownloadError as he:
+                            new_src = None
+                            t.note = str(he)
+                        if new_src is not None:
+                            t.status = "starting"
+                            t.note = "구글 제한 → 내 드라이브 사본으로 받는 중"
+                            src = new_src
+                            continue
+                    limited = qe
+                    break
+            t.done_bytes = dl.done_bytes()
             if dl.auto and dl._best_rate > 0 and (t.size or 0) >= 64 * MIN_SPLIT:
                 # 다음 파일은 이번에 찾은 값 근처에서 시작 (처음부터 다시 올라가지 않게)
                 with self.lock:
@@ -913,10 +1000,20 @@ class DownloadManager:
                     self._delete_partial(t)
                     if t in self.tasks:
                         self.tasks.remove(t)
+                elif limited is not None and want != "pause":
+                    # 받은 부분은 그대로 두고 기다렸다가 자동으로 이어받기
+                    wait_min = LIMIT_WAITS[min(t.limit_hits, len(LIMIT_WAITS) - 1)]
+                    t.limit_hits += 1
+                    t.status = "waiting"
+                    t.retry_at = time.time() + wait_min * 60
+                    t.error = str(limited)
+                    if not t.note:
+                        t.note = "구글 로그인하면 내 드라이브 사본으로 기다리지 않고 받을 수 있음"
                 elif err is not None and not (want == "pause" and stop.is_set()):
                     t.status = "error"
                     t.error = str(err) or err.__class__.__name__
                 elif result:
+                    t.limit_hits = 0
                     t.status = "skipped" if getattr(holder[0], "skipped", False) else "done"
                     if t.size is not None:
                         t.done_bytes = t.size

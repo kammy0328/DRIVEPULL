@@ -178,3 +178,72 @@ def test_size_changed(server, tmp_path):
     dl = SegmentedDownload(t, FakeSource(server), 4, threading.Event())
     with pytest.raises(DownloadError):
         dl.run()
+
+
+class QuotaOnce(FakeSource):
+    """처음 몇 번은 정상, 그다음 한 번 구글 제한, 이후 정상."""
+    def __init__(self, url):
+        super().__init__(url)
+        self.n = 0
+        self.fired = False
+
+    def open(self, sess, start, end):
+        self.n += 1
+        if self.n == 3 and not self.fired:
+            self.fired = True
+            from drivepull.engine import QuotaExceeded
+            raise QuotaExceeded("구글 다운로드 제한")
+        return super().open(sess, start, end)
+
+
+def test_quota_waits_and_resumes(server, tmp_path, monkeypatch):
+    import drivepull.engine as E
+    monkeypatch.setattr(E, "LIMIT_WAITS", (0.03,))   # 1.8초
+    Handler.delay, Handler.fail_every = 0.02, 0
+    src = QuotaOnce(server)
+    m = DownloadManager(S(), lambda t: src, tmp_path / "q.json")
+    t = Task(name="q.bin", dest=str(tmp_path / "q.bin"), source={"id": "q"}, md5=MD5, size=SIZE)
+    m.add([t])
+    seen = set()
+    deadline = time.time() + 60
+    while time.time() < deadline and t.status != "done":
+        seen.add(t.status)
+        if t.status == "waiting":
+            assert t.retry_at > time.time() - 1
+        time.sleep(0.1)
+    Handler.delay = 0
+    assert "waiting" in seen, seen
+    assert t.status == "done", (t.status, t.error)
+    assert _md5(t.dest) == MD5
+    m.shutdown()
+
+
+def test_verify_frees_slot(server, tmp_path, monkeypatch):
+    """MD5 검증 중에도 다음 파일 다운로드가 시작돼야 함."""
+    import drivepull.engine as E
+    Handler.delay, Handler.fail_every = 0, 0
+    gate = threading.Event()
+    real = E.md5_file
+
+    def slow_md5(path, progress=None, stop=None):
+        gate.wait(20)
+        return real(path, progress, stop)
+
+    monkeypatch.setattr(E, "md5_file", slow_md5)
+
+    class One(S):
+        concurrent_files = 1
+
+    m = DownloadManager(One(), lambda t: FakeSource(server), tmp_path / "q.json")
+    a = Task(name="a.bin", dest=str(tmp_path / "a.bin"), source={"id": "a"}, md5=MD5, size=SIZE)
+    b = Task(name="b.bin", dest=str(tmp_path / "b.bin"), source={"id": "b"}, md5=MD5, size=SIZE)
+    m.add([a, b])
+    deadline = time.time() + 30
+    while time.time() < deadline and not (a.status == "verifying" and b.status in ("downloading", "verifying")):
+        time.sleep(0.05)
+    assert a.status == "verifying" and b.status in ("downloading", "verifying"), (a.status, b.status)
+    gate.set()
+    while time.time() < deadline and not (a.status == b.status == "done"):
+        time.sleep(0.1)
+    assert a.status == b.status == "done"
+    m.shutdown()

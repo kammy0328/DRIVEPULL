@@ -677,6 +677,8 @@ class MainWindow(QMainWindow):
                 self.dl.addTopLevelItem(q)
                 self._dl_rows[t.uid] = q
             prog = (t.done_bytes / t.size) if t.size else (1.0 if t.status in ("done", "skipped") else 0.0)
+            if t.status == "verifying" and t.size:
+                prog = t.verify_bytes / t.size
             q.setData(2, PROGRESS_ROLE, prog)
             q.setData(2, STATUS_ROLE, t.status)
             q.setText(1, fmt_size(t.size))
@@ -688,9 +690,13 @@ class MainWindow(QMainWindow):
             if t.status == "downloading" and t.connections:
                 label = f"{label} · {t.connections}연결"
             if t.status == "error":
-                label = f"오류: {t.error}"
+                label = "오류: " + (t.error.split(".")[0].split(" (")[0] if t.error else "")
+            elif t.status == "waiting":
+                import time as _time
+                left = max(0, int((t.retry_at - _time.time()) // 60) + 1)
+                label = f"구글 제한 · {left}분 후 재시도"
             q.setText(5, label)
-            color = {"done": style.OK, "skipped": style.OK, "error": style.ERR,
+            color = {"done": style.OK, "skipped": style.OK, "error": style.ERR, "waiting": style.WARN,
                      "paused": style.MUTED, "queued": style.MUTED}.get(t.status, style.TEXT)
             q.setForeground(5, QColor(color))
             tip = t.dest + (f"\n{t.error}" if t.error else "") + (f"\n{t.note}" if t.note else "")
@@ -698,7 +704,7 @@ class MainWindow(QMainWindow):
             q.setToolTip(5, tip)
             if running:
                 active += 1
-            elif t.status == "queued":
+            elif t.status in ("queued", "waiting"):
                 queued += 1
             elif t.status in ("done", "skipped"):
                 done += 1

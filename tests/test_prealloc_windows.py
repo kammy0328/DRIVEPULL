@@ -28,3 +28,10 @@ def test_prealloc_40gb_instant(tmp_path):
         assert time.monotonic() - t0 < 3.0
     finally:
         os.remove(p)
+
+
+def test_disk_type_query(tmp_path):
+    from drivepull.engine import disk_is_hdd
+    r = disk_is_hdd(str(tmp_path / "x.mov"))
+    print("C: seek penalty (HDD) =", r)
+    assert r in (True, False)   # Windows 로컬 드라이브면 판별 가능해야 함

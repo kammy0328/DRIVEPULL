@@ -40,7 +40,7 @@ class Service:
     def _quota_fallback(self, t: Task, err):
         """할당량 초과 파일을 내 드라이브에 사본으로 만든 뒤 사본을 받는다."""
         if not self.auth.logged_in:
-            raise DownloadError("구글 다운로드 할당량 초과. 구글 로그인하면 내 드라이브 사본으로 받을 수 있습니다")
+            return None   # 로그인 안 됨 → 대기 후 자동 재시도
         api = self.api()
         orig = t.source["id"]
         try:

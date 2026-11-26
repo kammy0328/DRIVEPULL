@@ -82,7 +82,7 @@ class ProgressDelegate(QStyledItemDelegate):
 
     COLORS = {
         "done": style.OK, "skipped": style.OK, "error": style.ERR, "paused": "#6b7280",
-        "verifying": style.WARN,
+        "verifying": style.WARN, "waiting": style.WARN,
     }
 
     def paint(self, p: QPainter, opt, idx):

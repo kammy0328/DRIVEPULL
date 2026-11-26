@@ -471,8 +471,32 @@ class ApiSource:
         raise DownloadError("구글이 악성 파일로 표시해 다운로드를 막았습니다")
 
 
+QUOTA_PHRASES = (
+    "too many users have viewed or downloaded this file recently",
+    "download quota for this file has been exceeded",
+    "exceeds the download quota",
+    "최근에 너무 많은 사용자가",
+    "다운로드 할당량을 초과",
+)
+
+
+def _save_unknown_page(r: requests.Response, text: str) -> None:
+    try:
+        from .config import app_dir
+        (app_dir() / "last_google_page.html").write_text(
+            f"<!-- {r.status_code} {r.url} -->\n" + text[:200000], encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 class PublicSource:
-    """로그인 없이 공개 링크로 받기 (drive.usercontent.google.com)."""
+    """로그인 없이 공개 링크로 받기 (drive.usercontent.google.com).
+
+    로그인 없는 다운로드는 요청이 많으면 구글이 파일을 일시 차단하므로
+    연결 수와 구간 재분할을 줄여서 요청 횟수를 낮춘다.
+    """
+    max_connections = 6
+    min_split = 256 << 20
 
     def __init__(self, fid: str, rk: str = ""):
         self.fid = fid
@@ -491,8 +515,8 @@ class PublicSource:
         """HTML이 오면 원인 판단 후, 확인 폼이면 진짜 다운로드 URL을 돌려준다."""
         text = r.text
         low = text.lower()
-        if "too many users have viewed or downloaded" in low or "quota" in low and "exceeded" in low:
-            raise QuotaExceeded("구글 다운로드 할당량 초과 (많은 사람이 받은 파일)")
+        if any(p in low for p in QUOTA_PHRASES):
+            raise QuotaExceeded("구글 다운로드 제한 (짧은 시간에 요청이 많았던 파일)")
         if "accounts.google.com" in r.url or "servicelogin" in low:
             raise DownloadError("공개 파일이 아닙니다. 구글 로그인 후 다시 시도하세요")
         m = re.search(r'<form[^>]+id="download-form"[^>]+action="([^"]+)"', text)
@@ -502,7 +526,11 @@ class PublicSource:
             return action + "?" + urlencode(inputs)
         if r.status_code == 404:
             raise DownloadError("파일을 찾을 수 없습니다")
-        raise DownloadError("다운로드 페이지를 해석하지 못했습니다. 구글 로그인 후 다시 시도하세요")
+        # 모르는 페이지: 진단용으로 저장하고 잠시 후 재시도 (일시적인 차단 페이지일 수 있음)
+        _save_unknown_page(r, text)
+        m = re.search(r"<title>(.*?)</title>", text, re.S)
+        title = html.unescape(m.group(1)).strip()[:60] if m else f"HTTP {r.status_code}"
+        raise TransientError(f"구글이 다운로드 대신 안내 페이지를 보냄 ({title})", wait=30, throttle=True)
 
     def _get(self, sess, url, start, end) -> requests.Response:
         h = {}
