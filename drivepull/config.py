@@ -9,7 +9,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 APP_NAME = "DRIVEPULL"
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.2.0"
 
 
 def app_dir() -> Path:

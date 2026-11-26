@@ -76,7 +76,7 @@ class FakeSource:
         return ProbeResult(SIZE, r.status_code == 206)
 
     def open(self, sess, start, end):
-        h = {"Range": f"bytes={start}-{end}"} if start is not None else {}
+        h = {"Range": f"bytes={start}-{'' if end is None else end}"} if start is not None else {}
         r = sess.get(self.url, headers=h, stream=True, timeout=10)
         if r.status_code >= 500:
             r.close()
@@ -160,3 +160,23 @@ def test_manager(server, tmp_path):
     assert m.snapshot()[0].status == "skipped"
     m.shutdown()
     assert (tmp_path / "q.json").exists()
+
+
+def test_known_size_skips_probe(server, tmp_path):
+    Handler.delay, Handler.fail_every = 0, 0
+    t = _task(str(tmp_path))
+    t.size = SIZE
+    before = Handler.counter
+    dl = SegmentedDownload(t, FakeSource(server), 8, threading.Event())
+    assert dl.run() is True
+    assert _md5(t.dest) == MD5
+    assert Handler.counter - before == len(dl.segs)  # 구간마다 요청 1번, 크기 확인 요청 없음
+
+
+def test_size_changed(server, tmp_path):
+    Handler.delay, Handler.fail_every = 0, 0
+    t = _task(str(tmp_path))
+    t.size = SIZE + 10
+    dl = SegmentedDownload(t, FakeSource(server), 4, threading.Event())
+    with pytest.raises(DownloadError):
+        dl.run()

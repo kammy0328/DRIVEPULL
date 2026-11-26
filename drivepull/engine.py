@@ -85,6 +85,12 @@ def _set_sparse(fh, on: bool = True) -> bool:
         return False
 
 
+def _range_total(cr: str) -> Optional[int]:
+    import re
+    m = re.match(r"bytes \d+-\d+/(\d+)", cr or "")
+    return int(m.group(1)) if m else None
+
+
 def make_session() -> requests.Session:
     s = requests.Session()
     ad = HTTPAdapter(pool_connections=2, pool_maxsize=4, max_retries=0)
@@ -204,6 +210,7 @@ class SegmentedDownload:
         self.active_workers = 0
         self._single_done = 0
         self.skipped = False
+        self._prefetch = None   # (구간, 시작 위치, 응답): 첫 요청 응답을 첫 구간에 그대로 사용
 
     # ---- 진행률
     def done_bytes(self) -> int:
@@ -278,13 +285,17 @@ class SegmentedDownload:
         try:
             while seg.remaining > 0 and not self._halted():
                 try:
-                    resp = self.source.open(sess, seg.pos, seg.end)
+                    resp = self._take_prefetch(seg) or self.source.open(sess, seg.pos, seg.end)
                     try:
                         if resp.status_code != 206:
                             raise DownloadError("서버가 구간 다운로드를 지원하지 않습니다")
                         cr = resp.headers.get("Content-Range", "")
                         if not cr.startswith(f"bytes {seg.pos}-"):
                             raise TransientError(f"잘못된 Content-Range: {cr}")
+                        total = _range_total(cr)
+                        if total is not None and self.size is not None and total != self.size:
+                            self._clear_state()
+                            raise DownloadError("원본 파일 크기가 바뀌었습니다. 다시 시도하면 처음부터 받습니다")
                         for chunk in resp.iter_content(CHUNK):
                             if self._halted():
                                 break
@@ -323,6 +334,14 @@ class SegmentedDownload:
             with self.lock:
                 seg.active = False
 
+    def _take_prefetch(self, seg: _Seg):
+        with self.lock:
+            pf = self._prefetch
+            if pf is not None and pf[0] is seg and seg.pos == pf[1]:
+                self._prefetch = None
+                return pf[2]
+        return None
+
     def _worker(self) -> None:
         sess = make_session()
         try:
@@ -347,13 +366,13 @@ class SegmentedDownload:
             sess.close()
 
     # ---- 단일 스트림 (크기를 모르거나 Range 미지원)
-    def _run_single(self) -> bool:
+    def _run_single(self, first=None) -> bool:
         sess = make_session()
         self._single_done = 0
         attempt = 0
         while True:
             try:
-                resp = self.source.open(sess, None, None)
+                resp, first = (first, None) if first is not None else (self.source.open(sess, None, None), None)
                 try:
                     with open(fs_path(self.task.part_path), "wb") as fh:
                         for chunk in resp.iter_content(CHUNK):
@@ -382,47 +401,45 @@ class SegmentedDownload:
         t = self.task
         os.makedirs(fs_path(os.path.dirname(t.dest) or "."), exist_ok=True)
 
-        sess = make_session()
-        attempt = 0
-        while True:
-            try:
-                probe: ProbeResult = self.source.probe(sess)
-                break
-            except DownloadError:
-                raise
-            except (TransientError, requests.RequestException) as e:
-                attempt += 1
-                if attempt > 5:
-                    raise DownloadError(f"연결 실패: {e}")
-                if self.stop.wait(min(20.0, 2 ** attempt)):
+        first = None
+        size = t.size
+        resumed = size is not None and self._load_state(size)
+        if size is None:
+            # 크기를 모르면 0번 바이트부터 요청하고, 그 응답을 첫 구간 다운로드로 그대로 쓴다
+            first = self._first_request()
+            if first is None:
+                return False
+            if first.status_code == 206:
+                size = _range_total(first.headers.get("Content-Range", ""))
+            if size is None or first.status_code != 206:
+                cl = first.headers.get("Content-Length")
+                if first.status_code == 200 and cl and cl.isdigit():
+                    t.size = int(cl)
+                t.note = "단일 연결 (서버가 구간 다운로드를 지원하지 않음)"
+                self.status_cb("downloading")
+                if not self._run_single(first):
                     return False
-        sess.close()
-
-        if probe.size is not None:
-            t.size = probe.size
-        self.size = probe.size
+                return self._finish()
+            t.size = size
+        self.size = size
 
         # 같은 파일이 이미 받아져 있으면 건너뛴다
-        if probe.size is not None and os.path.exists(fs_path(t.dest)) \
+        if not resumed and os.path.exists(fs_path(t.dest)) \
                 and not os.path.exists(fs_path(t.part_path)) \
-                and os.path.getsize(fs_path(t.dest)) == probe.size:
+                and os.path.getsize(fs_path(t.dest)) == size:
+            if first is not None:
+                first.close()
             self.skipped = True
-            self._single_done = probe.size
+            self._single_done = size
             return True
 
-        if probe.size is None or not probe.supports_range:
-            t.note = "단일 연결 (서버가 구간 다운로드를 지원하지 않음)"
-            self.status_cb("downloading")
-            if not self._run_single():
-                return False
-            return self._finish()
-
-        size = probe.size
         if size == 0:
+            if first is not None:
+                first.close()
             open(fs_path(t.part_path), "wb").close()
             return self._finish()
 
-        if not self._load_state(size):
+        if not resumed:
             self._clear_state()
             with open(fs_path(t.part_path), "wb") as f:
                 _set_sparse(f, True)
@@ -435,6 +452,12 @@ class SegmentedDownload:
                 b = size - 1 if i == n - 1 else (i + 1) * step - 1
                 self.segs.append(_Seg(a, b))
             self._save_state()
+        if first is not None:
+            seg0 = next((sg for sg in self.segs if sg.start == 0 and sg.remaining > 0 and sg.pos == 0), None)
+            if seg0 is not None:
+                self._prefetch = (seg0, 0, first)
+            else:
+                first.close()
 
         if self.done_bytes() >= size:
             return self._finish()
@@ -449,12 +472,31 @@ class SegmentedDownload:
                 w.join(STATE_SAVE_INTERVAL / len(workers))
             self._save_state()
         self._save_state()
+        with self.lock:
+            if self._prefetch is not None:
+                self._prefetch[2].close()
+                self._prefetch = None
 
         if self.fatal is not None:
             raise self.fatal
         if self.done_bytes() < size:
             return False  # 일시정지
         return self._finish()
+
+    def _first_request(self):
+        sess = make_session()
+        attempt = 0
+        while True:
+            try:
+                return self.source.open(sess, 0, None)
+            except DownloadError:
+                raise
+            except (TransientError, requests.RequestException) as e:
+                attempt += 1
+                if attempt > 5:
+                    raise DownloadError(f"연결 실패: {e}")
+                if self.stop.wait(min(20.0, 2 ** attempt)):
+                    return None
 
     def _finish(self) -> bool:
         t = self.task
@@ -503,6 +545,7 @@ class DownloadManager:
         self._running: dict[str, tuple[threading.Thread, threading.Event, list]] = {}
         self._want: dict[str, str] = {}
         self._quit = threading.Event()
+        self._wake = threading.Event()
         self._dirty = False
         self._sched = threading.Thread(target=self._loop, daemon=True)
         self._sched.start()
@@ -520,6 +563,7 @@ class DownloadManager:
                     t.done_bytes = t.size
                 self.tasks.append(t)
             self._dirty = True
+        self._wake.set()
 
     def get(self, uid: str) -> Optional[Task]:
         with self.lock:
@@ -546,6 +590,7 @@ class DownloadManager:
                     t.status = "queued"
                     t.error = ""
             self._dirty = True
+        self._wake.set()
 
     def retry(self, uids) -> None:
         self.resume(uids)
@@ -635,7 +680,11 @@ class DownloadManager:
     def _loop(self) -> None:
         last_stat = time.monotonic()
         last_save = time.monotonic()
-        while not self._quit.wait(0.25):
+        while not self._quit.is_set():
+            self._wake.wait(0.25)
+            self._wake.clear()
+            if self._quit.is_set():
+                break
             now = time.monotonic()
             with self.lock:
                 limit = max(1, int(self.settings.concurrent_files))
@@ -721,6 +770,7 @@ class DownloadManager:
                 else:
                     t.status = "paused"
                 self._dirty = True
+            self._wake.set()
             if cleanup and (result or want == "remove"):
                 try:
                     cleanup(t)
@@ -737,4 +787,5 @@ class DownloadManager:
         for _, (th, _, _) in running:
             th.join(max(0.1, end - time.monotonic()))
         self._quit.set()
+        self._wake.set()
         self.save_queue()

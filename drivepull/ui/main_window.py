@@ -17,7 +17,9 @@ from ..drive import DriveItem, DriveLink, list_api, list_public, parse_link, pro
 from ..engine import STATUS_LABEL, DownloadError
 from ..service import Service
 from . import style
+from .grid import ThumbGrid, info_text
 from .settings_dialog import SettingsDialog
+from .thumbs import ThumbLoader
 from .widgets import (PROGRESS_ROLE, STATUS_ROLE, FadeIn, ProgressDelegate, Spinner, fmt_eta,
                       fmt_size, fmt_speed)
 
@@ -52,6 +54,7 @@ class MainWindow(QMainWindow):
         self._id_to_items: dict[str, list[QTreeWidgetItem]] = {}
         self._dl_rows: dict[str, QTreeWidgetItem] = {}
         self._prev_text = ""
+        self.loader = ThumbLoader(lambda: self.svc.auth.headers())
 
         self.setWindowTitle(f"{APP_NAME} {APP_VERSION}")
         self.resize(1120, 760)
@@ -163,6 +166,21 @@ class MainWindow(QMainWindow):
         self.count_lbl.setObjectName("muted")
         head.addWidget(self.count_lbl)
         head.addStretch(1)
+        vw = QFrame()
+        vw.setObjectName("segWrap")
+        vl = QHBoxLayout(vw)
+        vl.setContentsMargins(3, 3, 3, 3)
+        vl.setSpacing(2)
+        self.view_group = QButtonGroup(self)
+        for i, text in enumerate(("목록", "썸네일")):
+            b = QPushButton(text)
+            b.setObjectName("seg")
+            b.setCheckable(True)
+            b.setCursor(Qt.PointingHandCursor)
+            self.view_group.addButton(b, i)
+            vl.addWidget(b)
+        self.view_group.idClicked.connect(self._set_view)
+        head.addWidget(vw)
         self.filter = QLineEdit()
         self.filter.setPlaceholderText("이름·확장자 검색 (예: .mov)")
         self.filter.setFixedWidth(240)
@@ -177,7 +195,7 @@ class MainWindow(QMainWindow):
         v.addLayout(head)
 
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["이름", "크기", "종류"])
+        self.tree.setHeaderLabels(["이름", "정보", "크기", "종류"])
         self.tree.setAlternatingRowColors(True)
         self.tree.setUniformRowHeights(True)
         self.tree.setAnimated(True)
@@ -186,10 +204,9 @@ class MainWindow(QMainWindow):
         hh = self.tree.header()
         hh.setStretchLastSection(False)
         hh.setSectionResizeMode(0, QHeaderView.Stretch)
-        hh.setSectionResizeMode(1, QHeaderView.Fixed)
-        hh.setSectionResizeMode(2, QHeaderView.Fixed)
-        self.tree.setColumnWidth(1, 110)
-        self.tree.setColumnWidth(2, 90)
+        for col, wd in ((1, 150), (2, 100), (3, 80)):
+            hh.setSectionResizeMode(col, QHeaderView.Fixed)
+            self.tree.setColumnWidth(col, wd)
         self.tree.itemChanged.connect(lambda *_: self._summary_timer.start())
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._tree_menu)
@@ -197,7 +214,14 @@ class MainWindow(QMainWindow):
         space.setShortcut(QKeySequence(Qt.Key_Space))
         space.triggered.connect(self._toggle_selected)
         self.tree.addAction(space)
-        v.addWidget(self.tree, 1)
+        self.grid = ThumbGrid(self.loader)
+        self.view_stack = QStackedWidget()
+        self.view_stack.addWidget(self.tree)
+        self.view_stack.addWidget(self.grid)
+        v.addWidget(self.view_stack, 1)
+        view = 1 if self.s.extra.get("view") == "grid" else 0
+        self.view_group.button(view).setChecked(True)
+        self.view_stack.setCurrentIndex(view)
 
         bottom = QFrame()
         bottom.setObjectName("card")
@@ -378,6 +402,7 @@ class MainWindow(QMainWindow):
         req = self._req
         self.msg.hide()
         self._switch_page(0)
+        self.grid.set_root(None)
         self.tree.clear()
         self._id_to_items.clear()
         self.root_item = None
@@ -431,6 +456,7 @@ class MainWindow(QMainWindow):
             self._toast(err, error=True)
             return
         self.root_item = root
+        self.grid.set_root(None)
         self.tree.blockSignals(True)
         self.tree.clear()
         self._id_to_items.clear()
@@ -443,27 +469,35 @@ class MainWindow(QMainWindow):
         mode = "" if root.mode == "api" else " · 공개 링크 모드"
         self.count_lbl.setText(f"파일 {len(files):,}개{mode}")
         self._recalc_folder_sizes()
+        self.grid.set_root(top)
         self._update_summary()
         self._apply_filter(self.filter.text())
+        # 영상·이미지가 대부분인 폴더는 처음 한 번 썸네일 보기로 보여준다
+        if "view" not in self.s.extra and files:
+            from .grid import IMAGE_EXT, is_video
+            media = sum(1 for f in files if is_video(f) or _ext(f.name).lower() in IMAGE_EXT)
+            if media / len(files) >= 0.6:
+                self._set_view(1)
 
     def _make_item(self, it: DriveItem, parent: QTreeWidgetItem | None) -> QTreeWidgetItem:
         q = QTreeWidgetItem(parent) if parent is not None else QTreeWidgetItem()
         q.setText(0, it.name)
         q.setData(0, ITEM_ROLE, it)
-        q.setTextAlignment(1, Qt.AlignRight | Qt.AlignVCenter)
-        q.setTextAlignment(2, Qt.AlignCenter)
+        q.setTextAlignment(2, Qt.AlignRight | Qt.AlignVCenter)
+        q.setTextAlignment(3, Qt.AlignCenter)
         if it.is_folder:
             q.setFlags(q.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsAutoTristate)
-            q.setText(2, "폴더")
-            q.setForeground(2, QColor(style.MUTED))
+            q.setText(3, "폴더")
+            q.setForeground(3, QColor(style.MUTED))
             for c in it.children:
                 self._make_item(c, q)
             q.setCheckState(0, Qt.Checked if it.children else Qt.Unchecked)
         else:
-            q.setText(1, fmt_size(it.size))
-            q.setText(2, _ext(it.name))
-            q.setForeground(1, QColor(style.MUTED))
-            q.setForeground(2, QColor(style.MUTED))
+            q.setText(1, info_text(it))
+            q.setText(2, fmt_size(it.size))
+            q.setText(3, _ext(it.name))
+            for col in (1, 2, 3):
+                q.setForeground(col, QColor(style.MUTED))
             self._id_to_items.setdefault(it.id, []).append(q)
             if it.unsupported:
                 q.setFlags(q.flags() & ~Qt.ItemIsUserCheckable & ~Qt.ItemIsEnabled)
@@ -477,7 +511,8 @@ class MainWindow(QMainWindow):
 
     def _on_size(self, fid: str, size):
         for q in self._id_to_items.get(fid, []):
-            q.setText(1, fmt_size(size))
+            q.setText(2, fmt_size(size))
+        self.grid.refresh_checks(sizes_changed=True)
         self._folder_timer.start()
         self._summary_timer.start()
 
@@ -487,7 +522,7 @@ class MainWindow(QMainWindow):
             if not it.is_folder:
                 return it.size or 0
             total = sum(rec(q.child(i)) for i in range(q.childCount()))
-            q.setText(1, fmt_size(total) if total else "-")
+            q.setText(2, fmt_size(total) if total else "-")
             return total
 
         self.tree.blockSignals(True)
@@ -529,6 +564,7 @@ class MainWindow(QMainWindow):
         else:
             self.sel_lbl.setText("선택 없음" if self.root_item else "")
         self.start_btn.setEnabled(bool(sel))
+        self.grid.refresh_checks()
 
     def _check_all(self, on: bool):
         state = Qt.Checked if on else Qt.Unchecked
@@ -564,7 +600,15 @@ class MainWindow(QMainWindow):
         elif act == a4:
             self.tree.collapseAll()
 
+    def _set_view(self, i: int):
+        self.view_group.button(i).setChecked(True)
+        if self.view_stack.currentIndex() != i:
+            self.view_stack.setCurrentIndex(i)
+        self.s.extra["view"] = "grid" if i == 1 else "list"
+        self.s.save()
+
     def _apply_filter(self, text: str):
+        self.grid.set_filter(text)
         text = text.strip().lower()
 
         def rec(q: QTreeWidgetItem) -> bool:
@@ -727,6 +771,7 @@ class MainWindow(QMainWindow):
         self._dl_timer.stop()
         if self._cancel:
             self._cancel.set()
+        self.loader.shutdown()
         self.svc.shutdown()
         e.accept()
 

@@ -18,7 +18,8 @@ USERCONTENT = "https://drive.usercontent.google.com/download"
 FOLDER_MIME = "application/vnd.google-apps.folder"
 SHORTCUT_MIME = "application/vnd.google-apps.shortcut"
 TIMEOUT = (15, 60)
-FIELDS = "id,name,mimeType,size,md5Checksum,resourceKey,shortcutDetails"
+FIELDS = ("id,name,mimeType,size,md5Checksum,resourceKey,shortcutDetails,thumbnailLink,"
+          "videoMediaMetadata(width,height,durationMillis),imageMediaMetadata(width,height)")
 
 # 구글 문서류는 오피스 파일로 내보낸다
 EXPORTS = {
@@ -83,6 +84,10 @@ class DriveItem:
     export_mime: Optional[str] = None
     unsupported: bool = False
     mode: str = "api"   # "api" | "public"
+    thumb_url: str = ""
+    width: int = 0
+    height: int = 0
+    duration_ms: int = 0
 
     def walk_files(self):
         if self.is_folder:
@@ -251,6 +256,13 @@ def _item_from_meta(m: dict) -> DriveItem:
         md5=m.get("md5Checksum"), resource_key=m.get("resourceKey", ""),
         is_folder=mime == FOLDER_MIME, mode="api",
     )
+    if m.get("thumbnailLink"):
+        # 기본 220px 썸네일 주소의 크기 부분만 바꿔서 큰 이미지로 받는다
+        it.thumb_url = re.sub(r"=s\d+$", "=s640", m["thumbnailLink"])
+    md = m.get("videoMediaMetadata") or m.get("imageMediaMetadata") or {}
+    it.width = int(md.get("width") or 0)
+    it.height = int(md.get("height") or 0)
+    it.duration_ms = int(md.get("durationMillis") or 0)
     if mime in EXPORTS:
         it.export_mime, ext = EXPORTS[mime]
         if not it.name.lower().endswith(ext):
@@ -341,6 +353,11 @@ def _public_folder(sess: requests.Session, fid: str, rk: str) -> tuple[str, list
     return title, entries
 
 
+def public_thumb(fid: str, rk: str = "") -> str:
+    u = f"https://drive.google.com/thumbnail?id={fid}&sz=w640"
+    return u + (f"&resourcekey={rk}" if rk else "")
+
+
 def list_public(link: DriveLink, progress: Callable[[int], None] | None = None,
                 cancel: threading.Event | None = None) -> DriveItem:
     sess = make_session()
@@ -348,7 +365,7 @@ def list_public(link: DriveLink, progress: Callable[[int], None] | None = None,
         src = PublicSource(link.id, link.resource_key)
         pr = src.probe(sess)
         return DriveItem(id=link.id, name=safe_name(pr.filename or link.id), size=pr.size, mode="public",
-                         resource_key=link.resource_key)
+                         resource_key=link.resource_key, thumb_url=public_thumb(link.id, link.resource_key))
     title, entries = _public_folder(sess, link.id, link.resource_key)
     root = DriveItem(id=link.id, name=safe_name(title), is_folder=True, mode="public",
                      resource_key=link.resource_key)
@@ -359,7 +376,8 @@ def list_public(link: DriveLink, progress: Callable[[int], None] | None = None,
             break
         folder, ents = stack.pop()
         for eid, name, crk, is_dir in ents:
-            it = DriveItem(id=eid, name=safe_name(name), is_folder=is_dir, mode="public", resource_key=crk)
+            it = DriveItem(id=eid, name=safe_name(name), is_folder=is_dir, mode="public", resource_key=crk,
+                           thumb_url="" if is_dir else public_thumb(eid, crk))
             folder.children.append(it)
             if is_dir:
                 _, sub = _public_folder(sess, eid, crk)
