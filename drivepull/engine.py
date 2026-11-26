@@ -25,6 +25,11 @@ CHUNK = 1 << 20            # 1 MiB 단위로 읽기
 MIN_SPLIT = 4 << 20        # 구간을 나눌 최소 크기
 MAX_RETRY = 10
 STATE_SAVE_INTERVAL = 1.0
+AUTO_START = 8             # 자동 조절 시작 연결 수 (이전 고정 기본값과 같음)
+TUNE_WINDOW = 2.0          # 속도 측정 간격(초)
+TUNE_GAIN = 1.08           # 연결을 늘렸을 때 이만큼(8%) 이상 빨라져야 유지
+TUNE_SETTLE = 1.5          # 새 연결이 첫 데이터를 받기까지 기다린 뒤 재기 시작(구글 응답 ~1초)
+TUNE_FAST = 1.4            # 늘렸을 때 이만큼(40%) 이상 빨라지면 다음엔 두 배로 늘림
 PART_SUFFIX = ".drivepull"
 
 
@@ -40,9 +45,10 @@ class QuotaExceeded(DownloadError):
 class TransientError(Exception):
     """재시도할 만한 일시적 오류 (429, 5xx 등)."""
 
-    def __init__(self, msg: str, wait: float | None = None):
+    def __init__(self, msg: str, wait: float | None = None, throttle: bool = False):
         super().__init__(msg)
         self.wait = wait
+        self.throttle = throttle   # 구글 요청 제한 (자동 조절이 연결을 줄이는 신호)
 
 
 @dataclass
@@ -83,6 +89,39 @@ def _set_sparse(fh, on: bool = True) -> bool:
         return bool(ok)
     except Exception:  # noqa: BLE001
         return False
+
+
+def _win_set_eof(fh, size: int) -> bool:
+    """SetFilePointerEx + SetEndOfFile 로 크기만 지정 (0 채우기 없음)."""
+    try:
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+        k32 = ctypes.windll.kernel32
+        k32.SetFilePointerEx.argtypes = [wintypes.HANDLE, ctypes.c_longlong,
+                                         ctypes.POINTER(ctypes.c_longlong), wintypes.DWORD]
+        k32.SetFilePointerEx.restype = wintypes.BOOL
+        k32.SetEndOfFile.argtypes = [wintypes.HANDLE]
+        k32.SetEndOfFile.restype = wintypes.BOOL
+        h = wintypes.HANDLE(msvcrt.get_osfhandle(fh.fileno()))
+        return bool(k32.SetFilePointerEx(h, size, None, 0)) and bool(k32.SetEndOfFile(h))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def preallocate(path: str, size: int) -> bool:
+    """받을 파일 크기만큼 미리 잡는다. 순간적으로 끝나면 True.
+
+    Python 의 truncate() 는 Windows 에서 늘린 만큼 0을 실제로 써서 40GB면 수십 초가 걸린다.
+    sparse 지정 후 SetEndOfFile 로 크기만 바꾼다.
+    """
+    with open(fs_path(path), "wb") as f:
+        if sys.platform == "win32":
+            sparse = _set_sparse(f, True)
+            if _win_set_eof(f, size):
+                return sparse
+        f.truncate(size)
+        return True
 
 
 def _range_total(cr: str) -> Optional[int]:
@@ -196,10 +235,23 @@ class _Seg:
 
 class SegmentedDownload:
     def __init__(self, task: Task, source, connections: int, stop: threading.Event,
-                 status_cb: Callable[[str], None] | None = None):
+                 status_cb: Callable[[str], None] | None = None,
+                 auto: bool = False, start: int | None = None):
         self.task = task
         self.source = source
-        self.connections = max(1, connections)
+        self.connections = max(1, connections)        # 최대 연결 수
+        self.auto = auto
+        self.target = min(self.connections, max(1, start or AUTO_START)) if auto else self.connections
+        self.best_target = self.target
+        self.throttled = 0          # 429·요청 제한 응답 횟수
+        self._retiring = 0
+        self._tune_t = 0.0
+        self._tune_c = 0
+        self._tune_probe: Optional[tuple[int, float]] = None
+        self._plateau_until = 0.0
+        self._settle_until = 0.0
+        self._best_rate = 0.0
+        self._fast = True           # 처음엔 두 배씩 늘린다
         self.stop = stop
         self.status_cb = status_cb or (lambda s: None)
         self.lock = threading.Lock()
@@ -280,10 +332,22 @@ class SegmentedDownload:
             self.fatal = e
         self.stop.set()
 
-    def _fetch(self, seg: _Seg, sess: requests.Session, fh) -> None:
+    def _should_retire(self) -> bool:
+        """자동 조절로 목표 연결 수가 줄면 남는 연결은 지금 구간을 반납하고 빠진다."""
+        if not self.auto:
+            return False
+        with self.lock:
+            if self.active_workers - self._retiring > self.target:
+                self._retiring += 1
+                return True
+        return False
+
+    def _fetch(self, seg: _Seg, sess: requests.Session, fh) -> bool:
+        """구간을 받는다. 연결을 줄여야 해서 중간에 빠지면 True."""
         attempt = 0
+        retire = False
         try:
-            while seg.remaining > 0 and not self._halted():
+            while seg.remaining > 0 and not self._halted() and not retire:
                 try:
                     resp = self._take_prefetch(seg) or self.source.open(sess, seg.pos, seg.end)
                     try:
@@ -298,6 +362,9 @@ class SegmentedDownload:
                             raise DownloadError("원본 파일 크기가 바뀌었습니다. 다시 시도하면 처음부터 받습니다")
                         for chunk in resp.iter_content(CHUNK):
                             if self._halted():
+                                break
+                            if self._should_retire():
+                                retire = True
                                 break
                             if not chunk:
                                 continue
@@ -317,22 +384,26 @@ class SegmentedDownload:
                         resp.close()
                 except DownloadError as e:
                     self._fail(e)
-                    return
+                    return False
                 except (TransientError, requests.RequestException, OSError) as e:
                     if isinstance(e, OSError) and not isinstance(e, requests.RequestException):
                         # 디스크 오류는 재시도 의미 없음
-                        if getattr(e, "errno", None) in (28,):  # ENOSPC
+                        if getattr(e, "errno", None) in (28, 112):  # ENOSPC / ERROR_DISK_FULL
                             self._fail(DownloadError("디스크 공간이 부족합니다"))
-                            return
+                            return False
+                    if getattr(e, "throttle", False):
+                        with self.lock:
+                            self.throttled += 1
                     attempt += 1
                     if attempt > MAX_RETRY:
                         self._fail(DownloadError(f"재시도 한도 초과: {e}"))
-                        return
+                        return False
                     wait = getattr(e, "wait", None) or min(30.0, 1.5 ** attempt) + random.random()
                     self.stop.wait(wait)
         finally:
             with self.lock:
                 seg.active = False
+        return retire
 
     def _take_prefetch(self, seg: _Seg):
         with self.lock:
@@ -351,17 +422,25 @@ class SegmentedDownload:
             return
         with self.lock:
             self.active_workers += 1
+        retired = False
         try:
             while not self._halted():
+                if self._should_retire():
+                    retired = True
+                    return
                 seg = self._acquire()
                 if seg is None:
                     return
-                self._fetch(seg, sess, fh)
+                if self._fetch(seg, sess, fh):
+                    retired = True
+                    return
         except BaseException as e:  # noqa: BLE001
             self._fail(DownloadError(f"내부 오류: {e!r}"))
         finally:
             with self.lock:
                 self.active_workers -= 1
+                if retired:
+                    self._retiring -= 1
             fh.close()
             sess.close()
 
@@ -441,9 +520,8 @@ class SegmentedDownload:
 
         if not resumed:
             self._clear_state()
-            with open(fs_path(t.part_path), "wb") as f:
-                _set_sparse(f, True)
-                f.truncate(size)
+            if not preallocate(t.part_path, size):
+                t.note = "이 드라이브(exFAT 등)는 sparse 파일을 지원하지 않아 초반 속도가 느릴 수 있음"
             n = max(1, min(self.connections, size // MIN_SPLIT or 1))
             step = size // n
             self.segs = []
@@ -463,14 +541,18 @@ class SegmentedDownload:
             return self._finish()
 
         self.status_cb("downloading")
-        workers = [threading.Thread(target=self._worker, daemon=True)
-                   for _ in range(self.connections)]
-        for w in workers:
-            w.start()
+        workers: list[threading.Thread] = []
+        self._spawn(workers, self.target)
+        last_save = time.monotonic()
         while any(w.is_alive() for w in workers):
-            for w in workers:
-                w.join(STATE_SAVE_INTERVAL / len(workers))
-            self._save_state()
+            alive = [w for w in workers if w.is_alive()]
+            alive[0].join(0.25)
+            now = time.monotonic()
+            if self.auto and not self._halted():
+                self._tune(now, workers)
+            if now - last_save >= STATE_SAVE_INTERVAL:
+                self._save_state()
+                last_save = now
         self._save_state()
         with self.lock:
             if self._prefetch is not None:
@@ -482,6 +564,70 @@ class SegmentedDownload:
         if self.done_bytes() < size:
             return False  # 일시정지
         return self._finish()
+
+    def _spawn(self, workers: list, n: int) -> None:
+        for _ in range(max(0, n)):
+            w = threading.Thread(target=self._worker, daemon=True)
+            w.start()
+            workers.append(w)
+
+    def _remaining(self) -> int:
+        with self.lock:
+            return sum(s.remaining for s in self.segs)
+
+    def _tune(self, now: float, workers: list) -> None:
+        """연결 수 자동 조절.
+
+        AUTO_START 개로 시작해서 TUNE_WINDOW 초마다 속도를 잰다.
+        - 처음엔 두 배씩 늘리다가, 늘려도 40% 미만으로 빨라지면 2~4개씩 늘린다.
+        - 연결을 늘린 뒤 속도가 GAIN 이상 오르면 유지하고 더 늘려본다.
+        - 거의 안 오르면 이전 개수로 되돌리고 잠시 멈췄다가 다시 시도한다 (회선 상태가 바뀔 수 있으니).
+        - 구글이 요청을 제한(429 등)하면 바로 40% 줄이고 한동안 늘리지 않는다.
+        """
+        if self.counter == 0:
+            self._tune_t = now   # 첫 데이터가 들어오기 전엔 재지 않음
+            return
+        if self._tune_t == 0.0 or now < self._settle_until:
+            self._tune_t, self._tune_c = now, self.counter   # 새 연결이 자리 잡는 동안은 재지 않음
+            with self.lock:
+                self.throttled = 0   # 줄이기 전에 이미 보낸 요청의 제한 응답은 무시
+            return
+        dt = now - self._tune_t
+        if dt < TUNE_WINDOW:
+            return
+        rate = (self.counter - self._tune_c) / dt
+        self._tune_t, self._tune_c = now, self.counter
+        with self.lock:
+            throttled, self.throttled = self.throttled, 0
+        if throttled:
+            self.target = max(2, int(self.target * 0.6))
+            self._tune_probe = None
+            self._plateau_until = now + 60
+            self._settle_until = now + TUNE_SETTLE
+            self.best_target = min(self.best_target, self.target)
+            return
+        if self._tune_probe is not None:
+            prev_target, prev_rate = self._tune_probe
+            self._tune_probe = None
+            if rate < prev_rate * TUNE_GAIN:
+                self.target = prev_target        # 늘려도 별 차이 없음 → 되돌림
+                self._plateau_until = now + 30
+                self._fast = False
+                return
+            self._fast = self._fast and rate >= prev_rate * TUNE_FAST
+        if rate >= self._best_rate * 0.95:
+            self._best_rate = max(self._best_rate, rate)
+            self.best_target = self.target
+        possible = max(1, self._remaining() // MIN_SPLIT)
+        cap = min(self.connections, possible)
+        if now >= self._plateau_until and self.target < cap and self.active_workers >= self.target:
+            step = self.target if self._fast else (2 if self.target < 8 else 4)
+            self._tune_probe = (self.target, rate)
+            new = min(cap, self.target + step)
+            old, self.target = self.target, new     # 목표를 먼저 올려야 새 연결이 바로 빠지지 않음
+            self._spawn(workers, new - old)
+            self._settle_until = now + TUNE_SETTLE
+            self._tune_t, self._tune_c = now, self.counter
 
     def _first_request(self):
         sess = make_session()
@@ -544,6 +690,7 @@ class DownloadManager:
         self.lock = threading.RLock()
         self._running: dict[str, tuple[threading.Thread, threading.Event, list]] = {}
         self._want: dict[str, str] = {}
+        self.learned: int | None = None   # 자동 조절로 찾은 연결 수 (다음 파일 시작값)
         self._quit = threading.Event()
         self._wake = threading.Event()
         self._dirty = False
@@ -707,7 +854,7 @@ class DownloadManager:
                         inst = (c - prev) / dt
                         t.speed = inst if t.speed == 0 else t.speed * 0.6 + inst * 0.4
                         t.done_bytes = dl.done_bytes()
-                        t.connections = dl.active_workers
+                        t.connections = dl.active_workers - dl._retiring
                     last_stat = now
             if self._dirty or now - last_save > 5:
                 self.save_queue()
@@ -732,7 +879,9 @@ class DownloadManager:
             src = self.source_factory(t)
             t.source["verify"] = bool(self.settings.verify_md5)
             while True:
-                dl = SegmentedDownload(t, src, int(self.settings.connections_per_file), stop, set_status)
+                auto = bool(getattr(self.settings, "auto_connections", False))
+                dl = SegmentedDownload(t, src, int(self.settings.connections_per_file), stop, set_status,
+                                       auto=auto, start=self.learned)
                 holder[0] = dl
                 holder[1] = 0
                 try:
@@ -747,6 +896,10 @@ class DownloadManager:
                         continue
                     raise
             t.done_bytes = dl.done_bytes() if result is not None else t.done_bytes
+            if dl.auto and dl._best_rate > 0 and (t.size or 0) >= 64 * MIN_SPLIT:
+                # 다음 파일은 이번에 찾은 값 근처에서 시작 (처음부터 다시 올라가지 않게)
+                with self.lock:
+                    self.learned = max(AUTO_START, dl.best_target)
         except BaseException as e:  # noqa: BLE001
             err = e
         finally:

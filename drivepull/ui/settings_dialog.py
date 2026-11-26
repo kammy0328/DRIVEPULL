@@ -22,16 +22,21 @@ class SettingsDialog(QDialog):
         lay.addWidget(t)
         form = QFormLayout()
         form.setSpacing(10)
+        self.auto = QCheckBox("연결 수 자동 조절 (4개에서 시작해 빨라지는 동안만 늘림)")
+        self.auto.setChecked(settings.auto_connections)
+        self.auto.toggled.connect(self._auto_toggled)
+        form.addRow(self.auto)
         self.conns = QSpinBox()
         self.conns.setRange(1, 32)
         self.conns.setValue(settings.connections_per_file)
-        self.conns.setToolTip("파일 하나를 몇 갈래로 나눠 동시에 받을지. 8~16 권장")
-        form.addRow("파일당 연결 수", self.conns)
+        form.addRow("", self.conns)
+        self.conns_lbl = form.labelForField(self.conns)
         self.files = QSpinBox()
         self.files.setRange(1, 10)
         self.files.setValue(settings.concurrent_files)
         form.addRow("동시에 받을 파일 수", self.files)
         lay.addLayout(form)
+        self._auto_toggled(self.auto.isChecked())
 
         self.md5 = QCheckBox("완료 후 MD5로 파일 손상 검사 (로그인 모드)")
         self.md5.setChecked(settings.verify_md5)
@@ -70,6 +75,10 @@ class SettingsDialog(QDialog):
         lay.addSpacing(6)
         lay.addLayout(btns)
 
+    def _auto_toggled(self, on: bool):
+        self.conns_lbl.setText("파일당 최대 연결 수" if on else "파일당 연결 수")
+        self.conns.setToolTip("자동 조절이 이 값을 넘지 않음" if on else "항상 이 개수로 나눠 받음")
+
     def _refresh_client(self):
         cfg = load_client_config()
         if cfg:
@@ -91,6 +100,7 @@ class SettingsDialog(QDialog):
 
     def _save(self):
         self.s.connections_per_file = self.conns.value()
+        self.s.auto_connections = self.auto.isChecked()
         self.s.concurrent_files = self.files.value()
         self.s.verify_md5 = self.md5.isChecked()
         self.s.quota_copy_fallback = self.quota.isChecked()

@@ -9,7 +9,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 APP_NAME = "DRIVEPULL"
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.3.0"
 
 
 def app_dir() -> Path:
@@ -32,7 +32,8 @@ CLIENT_SECRET_PATH = app_dir() / "client_secret.json"
 
 @dataclass
 class Settings:
-    connections_per_file: int = 8
+    connections_per_file: int = 16   # 자동 조절이 켜져 있으면 최대값
+    auto_connections: bool = True
     concurrent_files: int = 3
     verify_md5: bool = True
     quota_copy_fallback: bool = True
@@ -54,6 +55,11 @@ class Settings:
                     setattr(s, k, v)
         except (OSError, ValueError):
             pass
+        if not s.extra.get("v2"):
+            # 0.2 이하 기본값(8)은 자동 조절 최대값으로 쓰기엔 낮아서 16으로 올린다
+            if s.connections_per_file == 8:
+                s.connections_per_file = 16
+            s.extra["v2"] = True
         if not s.last_save_dir:
             s.last_save_dir = str(Path.home() / "Downloads")
         s.connections_per_file = max(1, min(32, int(s.connections_per_file)))

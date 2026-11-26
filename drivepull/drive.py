@@ -129,7 +129,8 @@ def _api_error(resp: requests.Response) -> Exception:
         return _Abusive()
     if code == 429 or reason in ("rateLimitExceeded", "userRateLimitExceeded", "backendError"):
         ra = resp.headers.get("Retry-After")
-        return TransientError(f"요청 제한 ({code})", float(ra) if ra and ra.isdigit() else None)
+        return TransientError(f"요청 제한 ({code})", float(ra) if ra and ra.isdigit() else None,
+                              throttle=code == 429 or "RateLimit" in reason or reason == "rateLimitExceeded")
     if code >= 500:
         return TransientError(f"구글 서버 오류 ({code})")
     if code == 401:
@@ -201,6 +202,8 @@ class DriveAPI:
             if isinstance(err, _Unauthorized) and self.auth is not None and self.auth.logged_in and attempt < 2:
                 self.auth.force_refresh()
                 continue
+            if isinstance(err, TransientError) and stream:
+                raise err   # 다운로드 요청은 엔진이 재시도하면서 연결 수도 조절한다
             if isinstance(err, TransientError) and attempt < 5:
                 threading.Event().wait(err.wait or 1.5 ** (attempt + 1))
                 continue
@@ -511,7 +514,7 @@ class PublicSource:
             raise TransientError(str(e))
         if r.status_code == 429 or r.status_code >= 500:
             r.close()
-            raise TransientError(f"서버 응답 {r.status_code}")
+            raise TransientError(f"서버 응답 {r.status_code}", throttle=r.status_code == 429)
         return r
 
     def _resolve(self, sess, start, end) -> requests.Response:
