@@ -29,7 +29,9 @@
 
 ## 설치 (사용자)
 
-Actions 탭의 최신 빌드 아티팩트 `DRIVEPULL-windows` 또는 Releases에서 `DRIVEPULL.exe` 를 받아서 실행. 설치 필요 없음.
+최신 버전 바로 받기: https://github.com/kammy0328/DRIVEPULL/releases/latest/download/DRIVEPULL.exe (설치 필요 없음)
+
+`drivepull/config.py` 의 `APP_VERSION` 을 올려서 main 에 푸시하면 빌드 후 해당 버전 Release 가 자동 생성됨. 같은 버전으로 다시 푸시하면 exe 만 교체.
 
 설정·로그인 토큰·대기열은 `%APPDATA%\DRIVEPULL\` 에 저장됨.
 
@@ -55,7 +57,7 @@ python run.py
 python -m pytest -q tests
 ```
 
-main 브랜치에 푸시하면 GitHub Actions가 테스트 후 `DRIVEPULL.exe` 를 빌드함. `v0.1.0` 같은 태그를 푸시하면 Release에 exe 첨부.
+main 브랜치에 푸시하면 GitHub Actions가 테스트 후 `DRIVEPULL.exe` 를 빌드하고 Release 에 올림.
 
 ```
 drivepull/

@@ -52,8 +52,17 @@ jobs:
           name: DRIVEPULL-windows
           path: dist/DRIVEPULL.exe
 
+      # main 에 올라온 버전(config.py APP_VERSION)의 Release 가 없으면 자동 생성
       - name: Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/DRIVEPULL.exe
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ver=$(python -c "import re;print(re.search(r'APP_VERSION = \"([^\"]+)\"', open('drivepull/config.py', encoding='utf-8').read()).group(1))")
+          if gh release view "v$ver" >/dev/null 2>&1; then
+            echo "v$ver 이미 있음: exe 교체"
+            gh release upload "v$ver" dist/DRIVEPULL.exe --clobber
+          else
+            gh release create "v$ver" dist/DRIVEPULL.exe --title "DRIVEPULL $ver" --generate-notes --latest
+          fi
