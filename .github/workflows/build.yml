@@ -1,0 +1,59 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows-exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller pytest
+
+      - name: Test
+        run: python -m pytest -q tests
+
+      - name: Embed OAuth client (GitHub Secrets)
+        shell: python
+        env:
+          CID: ${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}
+          CSEC: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
+        run: |
+          import os
+          cid, sec = os.environ.get("CID", ""), os.environ.get("CSEC", "")
+          with open("drivepull/_client_config.py", "w", encoding="utf-8") as f:
+              f.write(f"CLIENT_ID = {cid!r}\nCLIENT_SECRET = {sec!r}\n")
+          print("OAuth client embedded" if cid else "No OAuth secret: users load client_secret.json in settings")
+
+      - name: Build exe
+        run: >
+          pyinstaller --noconfirm --onefile --windowed --name DRIVEPULL
+          --icon assets/icon.ico --add-data "assets;assets"
+          --hidden-import drivepull._client_config
+          run.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DRIVEPULL-windows
+          path: dist/DRIVEPULL.exe
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/DRIVEPULL.exe
