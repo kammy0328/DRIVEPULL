@@ -26,7 +26,7 @@ jobs:
           pip install -r requirements.txt pyinstaller pytest
 
       - name: Test
-        run: python -m pytest -q tests
+        run: python -m pytest -q -s tests
 
       - name: Embed OAuth client (GitHub Secrets)
         shell: python
