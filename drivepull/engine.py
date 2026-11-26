@@ -126,6 +126,7 @@ def preallocate(path: str, size: int) -> bool:
 
 HDD_MAX_CONNS = 4
 _disk_cache: dict[str, Optional[bool]] = {}
+disk_debug: dict[str, str] = {}   # 판별 실패 원인 (진단용)
 
 
 def disk_is_hdd(path: str) -> Optional[bool]:
@@ -145,7 +146,7 @@ def disk_is_hdd(path: str) -> Optional[bool]:
     try:
         import ctypes
         from ctypes import wintypes
-        k32 = ctypes.windll.kernel32
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
         k32.CreateFileW.restype = wintypes.HANDLE
         k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
                                     wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
@@ -164,14 +165,31 @@ def disk_is_hdd(path: str) -> Optional[bool]:
                 _fields_ = [("Version", wintypes.DWORD), ("Size", wintypes.DWORD),
                             ("IncursSeekPenalty", wintypes.BOOLEAN)]
 
+            class Trim(ctypes.Structure):
+                _fields_ = [("Version", wintypes.DWORD), ("Size", wintypes.DWORD),
+                            ("TrimEnabled", wintypes.BOOLEAN)]
+
+            ret = wintypes.DWORD(0)
             q = Query(7, 0)   # StorageDeviceSeekPenaltyProperty, PropertyStandardQuery
             out = SeekPenalty()
-            ret = wintypes.DWORD(0)
             if k32.DeviceIoControl(h, 0x2D1400, ctypes.byref(q), ctypes.sizeof(q),
                                    ctypes.byref(out), ctypes.sizeof(out), ctypes.byref(ret), None):
                 result = bool(out.IncursSeekPenalty)
+            else:
+                disk_debug[key] = f"seek penalty 조회 실패 err={ctypes.get_last_error()}"
+                q2 = Query(8, 0)   # StorageDeviceTrimProperty: TRIM 이 켜져 있으면 SSD
+                tr = Trim()
+                if k32.DeviceIoControl(h, 0x2D1400, ctypes.byref(q2), ctypes.sizeof(q2),
+                                       ctypes.byref(tr), ctypes.sizeof(tr), ctypes.byref(ret), None) \
+                        and tr.TrimEnabled:
+                    result = False
+                else:
+                    disk_debug[key] += f", trim 조회 err={ctypes.get_last_error()}"
             k32.CloseHandle(h)
-    except Exception:  # noqa: BLE001
+        else:
+            disk_debug[key] = f"볼륨 열기 실패 err={ctypes.get_last_error()}"
+    except Exception as e:  # noqa: BLE001
+        disk_debug[key] = repr(e)
         result = None
     _disk_cache[key] = result
     return result

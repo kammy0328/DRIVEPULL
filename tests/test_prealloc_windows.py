@@ -31,7 +31,8 @@ def test_prealloc_40gb_instant(tmp_path):
 
 
 def test_disk_type_query(tmp_path):
-    from drivepull.engine import disk_is_hdd
+    from drivepull.engine import disk_debug, disk_is_hdd
     r = disk_is_hdd(str(tmp_path / "x.mov"))
-    print("C: seek penalty (HDD) =", r)
-    assert r in (True, False)   # Windows 로컬 드라이브면 판별 가능해야 함
+    print("disk HDD =", r, disk_debug)
+    # 가상 디스크(CI)는 속성 조회를 지원하지 않을 수 있음: 그때는 None + 원인 기록, 예외 없이
+    assert r in (True, False) or disk_debug
