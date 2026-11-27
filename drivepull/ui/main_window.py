@@ -9,7 +9,7 @@ from PySide6.QtCore import QObject, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QKeySequence
 from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QCheckBox, QComboBox, QFileDialog, QFrame,
                                QToolButton,
-                               QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMenu,
+                               QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMenu,
                                QMessageBox, QPushButton, QStackedWidget, QTreeWidget,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 
@@ -18,6 +18,7 @@ from ..drive import DriveItem, DriveLink, list_api, list_public, parse_link, pro
 from ..engine import STATUS_LABEL, UNFINISHED, DownloadError
 from ..service import Service
 from . import style
+from .columns import Columns
 from .grid import ThumbGrid, info_text, sort_value
 from .settings_dialog import SettingsDialog
 from .thumbs import ThumbLoader
@@ -311,11 +312,9 @@ class MainWindow(QMainWindow):
         self.tree.setTextElideMode(Qt.ElideMiddle)
         self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
         hh = self.tree.header()
-        hh.setStretchLastSection(False)
-        hh.setSectionResizeMode(0, QHeaderView.Stretch)
-        for col, wd in ((1, 150), (2, 100), (3, 80), (4, 100)):
-            hh.setSectionResizeMode(col, QHeaderView.Fixed)
-            self.tree.setColumnWidth(col, wd)
+        # 열 너비: 드래그 조절, 경계 더블클릭으로 내용 맞춤, 머리글 우클릭 메뉴, 너비 기억
+        self.tree_cols = Columns(self.tree, "files", self.s,
+                                 {0: 420, 1: 150, 2: 100, 3: 80, 4: 100}, fill_col=0)
         self.tree.itemChanged.connect(lambda *_: self._summary_timer.start())
         hh.setSortIndicatorShown(True)
         hh.setSectionsClickable(True)
@@ -400,11 +399,9 @@ class MainWindow(QMainWindow):
         self.dl.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.dl.setItemDelegateForColumn(2, ProgressDelegate(self.dl))
         hh = self.dl.header()
-        hh.setStretchLastSection(False)
-        hh.setSectionResizeMode(0, QHeaderView.Stretch)
-        for col, wd in ((1, 90), (2, 200), (3, 100), (4, 90), (5, 170), (6, 104)):
-            hh.setSectionResizeMode(col, QHeaderView.Fixed)
-            self.dl.setColumnWidth(col, wd)
+        self.dl_cols = Columns(self.dl, "downloads", self.s,
+                               {0: 380, 1: 90, 2: 200, 3: 100, 4: 90, 5: 170, 6: 104},
+                               fixed=(6,), fill_col=0, skip_fit=(2,))
         # 머리글을 누르면 정렬 (처음엔 추가한 순서)
         hh.setSortIndicator(-1, Qt.AscendingOrder)
         hh.setSortIndicatorShown(True)
