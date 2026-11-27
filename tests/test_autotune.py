@@ -132,4 +132,4 @@ def test_throttle_backs_off(srv, tmp_path):
     H.bucket = Bucket(200 * 1024 * 1024)   # 회선은 넉넉, 대신 7연결부터 429
     dl, hist = _run(srv, tmp_path, 32, 12)
     print("targets", hist)
-    assert hist[-1] <= 8
+    assert hist[-1] <= H.limit_conns   # 429 를 주는 개수 아래로 내려와 있어야 함
