@@ -629,13 +629,26 @@ class MainWindow(QMainWindow):
             else:
                 q.setFlags(q.flags() | Qt.ItemIsUserCheckable)
                 q.setCheckState(0, Qt.Checked)
+                if it.blocked:
+                    self._mark_blocked(q)
                 if it.export_mime:
                     q.setToolTip(0, "구글 문서 → 오피스 파일로 내보내기")
         return q
 
+    def _mark_blocked(self, q: QTreeWidgetItem):
+        """소유자가 다운로드를 막은 파일: 표시하고 선택 해제 (받으려 해도 실패하므로)."""
+        q.setText(1, "다운로드 막힘")
+        q.setForeground(1, QColor(style.ERR))
+        q.setCheckState(0, Qt.Unchecked)
+        q.setToolTip(0, "소유자가 다운로드를 막아둔 파일이에요. 드라이브에서 보기만 할 수 있어요.\n"
+                        "더블클릭하면 드라이브 미리보기를 브라우저로 열어요.")
+
     def _on_size(self, fid: str, size):
         for q in self._id_to_items.get(fid, []):
             q.setText(2, fmt_size(size))
+            it = q.data(0, ITEM_ROLE)
+            if it is not None and it.blocked and q.text(1) != "다운로드 막힘":
+                self._mark_blocked(q)
         self.grid.refresh_checks(sizes_changed=True)
         self._folder_timer.start()
         self._summary_timer.start()
@@ -779,6 +792,13 @@ class MainWindow(QMainWindow):
             self.play_item(q)
 
     def play_item(self, q: QTreeWidgetItem):
+        it = q.data(0, ITEM_ROLE)
+        if it is not None and it.blocked:
+            from PySide6.QtCore import QUrl
+            from PySide6.QtGui import QDesktopServices
+            QDesktopServices.openUrl(QUrl(f"https://drive.google.com/file/d/{it.id}/view"))
+            self._toast("다운로드가 막힌 파일이라 드라이브 미리보기를 브라우저로 열었어요")
+            return
         try:
             from ..stream import StreamServer
             from .player import PlayerDialog

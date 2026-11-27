@@ -149,6 +149,17 @@ class CardDelegate(QStyledItemDelegate):
         p.setFont(small)
         if not it.is_folder and it.duration_ms:
             self._badge(p, fmt_dur(it.duration_ms), th.right() - 8, th.bottom() - 8, align_right=True)
+        if not it.is_folder and getattr(it, "blocked", False):
+            p.save()
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(style.ERR))
+            fm = QFontMetrics(p.font())
+            txt = "다운로드 불가"
+            r = QRectF(th.left() + 36, th.top() + 9, fm.horizontalAdvance(txt) + 12, 18)
+            p.drawRoundedRect(r, 5, 5)
+            p.setPen(QColor("white"))
+            p.drawText(r, Qt.AlignCenter, txt)
+            p.restore()
         rb = res_badge(it.width, it.height)
         if rb:
             self._badge(p, rb, th.right() - 8, th.top() + 8, align_right=True, top=True)
@@ -326,7 +337,7 @@ class ThumbGrid(QWidget):
         self.delegate.play.connect(self.play_requested.emit)
         self.view.itemDoubleClicked.connect(self._double)
         self.view.verticalScrollBar().valueChanged.connect(lambda *_: self._vis_timer.start())
-        self.view.viewport().installEventFilter(self)
+        self.view.installEventFilter(self)   # 뷰 자체 크기 변화만 (스크롤바로 인한 뷰포트 변화는 무시)
         v.addWidget(self.view, 1)
 
         self.empty = QLabel("")
@@ -457,7 +468,10 @@ class ThumbGrid(QWidget):
     def _relayout(self):
         """카드가 가로 폭을 꽉 채우도록 실제 카드 폭을 계산."""
         pad = CardDelegate.PAD
-        vw = self.view.viewport().width() - 10  # 여유가 없으면 QListView가 한 칸 일찍 줄바꿈함
+        # 스크롤바가 보이든 안 보이든 같은 폭으로 계산해야 함.
+        # (뷰포트 폭 기준이면: 카드 커짐 → 스크롤바 생김 → 폭 줄어 카드 작아짐 → 스크롤바 사라짐 → … 무한 반복으로 화면이 떨림)
+        sb = self.view.style().pixelMetric(QStyle.PM_ScrollBarExtent)
+        vw = self.view.width() - 2 * self.view.frameWidth() - sb - 10
         cols = max(1, vw // (self.card_w + 2 * pad))
         eff = max(120, vw // cols - 2 * pad)
         if eff != self.eff_w:
@@ -530,7 +544,7 @@ class ThumbGrid(QWidget):
             self._double(sel[0])
 
     def eventFilter(self, obj, ev):
-        if obj is self.view.viewport() and ev.type() == QEvent.Resize:
+        if obj is self.view and ev.type() == QEvent.Resize:
             QTimer.singleShot(0, self._relayout)
             self._vis_timer.start()
         return False

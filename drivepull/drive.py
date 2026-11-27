@@ -20,6 +20,7 @@ FOLDER_MIME = "application/vnd.google-apps.folder"
 SHORTCUT_MIME = "application/vnd.google-apps.shortcut"
 TIMEOUT = (15, 60)
 FIELDS = ("id,name,mimeType,size,md5Checksum,resourceKey,shortcutDetails,thumbnailLink,modifiedTime,"
+          "capabilities(canDownload),"
           "videoMediaMetadata(width,height,durationMillis),imageMediaMetadata(width,height)")
 
 # 구글 문서류는 오피스 파일로 내보낸다
@@ -90,6 +91,7 @@ class DriveItem:
     height: int = 0
     duration_ms: int = 0
     modified: str = ""   # ISO 시각 (API 모드만)
+    blocked: bool = False   # 소유자가 보기 전용으로 다운로드를 막아둔 파일
 
     def walk_files(self):
         if self.is_folder:
@@ -131,6 +133,8 @@ def _api_error(resp: requests.Response) -> Exception:
         return QuotaExceeded("구글 다운로드 할당량 초과 (많은 사람이 받은 파일)")
     if reason == "cannotDownloadAbusiveFile":
         return _Abusive()
+    if reason in ("cannotDownloadFile", "cannotCopyFile") or "only the owner and editors can download" in message.lower():
+        return DownloadBlocked(BLOCKED_MSG)
     if code == 429 or reason in ("rateLimitExceeded", "userRateLimitExceeded", "backendError"):
         ra = resp.headers.get("Retry-After")
         return TransientError(f"요청 제한 ({code})", float(ra) if ra and ra.isdigit() else None,
@@ -148,6 +152,19 @@ def _api_error(resp: requests.Response) -> Exception:
             return DownloadError(f"소유자가 다운로드를 막아둔 파일입니다 ({message})")
         return DownloadError(f"권한 오류: {message or reason}")
     return DownloadError(f"오류 {code}: {message or reason}")
+
+
+class DownloadBlocked(DownloadError):
+    """소유자가 '뷰어 다운로드 금지'로 설정한 파일. 드라이브 웹 미리보기로만 볼 수 있음."""
+
+
+BLOCKED_MSG = "소유자가 다운로드를 막아둔 파일 (드라이브에서 보기만 가능)"
+BLOCKED_PHRASES = (
+    "hasn't given you permission to download",
+    "only the owner and editors can download",
+    "다운로드할 수 있는 권한을 부여하지",
+    "소유자 및 편집자만",
+)
 
 
 class _Abusive(Exception):
@@ -267,6 +284,8 @@ def _item_from_meta(m: dict) -> DriveItem:
         # 기본 220px 썸네일 주소의 크기 부분만 바꿔서 큰 이미지로 받는다
         it.thumb_url = re.sub(r"=s\d+$", "=s640", m["thumbnailLink"])
     it.modified = m.get("modifiedTime", "")
+    if (m.get("capabilities") or {}).get("canDownload") is False:
+        it.blocked = True
     md = m.get("videoMediaMetadata") or m.get("imageMediaMetadata") or {}
     it.width = int(md.get("width") or 0)
     it.height = int(md.get("height") or 0)
@@ -407,6 +426,8 @@ def probe_public_sizes(items: list[DriveItem], on_item: Callable[[DriveItem], No
             pr = PublicSource(it.id, it.resource_key).probe(sess)
             it.size = pr.size
             sess.close()
+        except DownloadBlocked:
+            it.blocked = True
         except Exception:  # noqa: BLE001
             return
         on_item(it)
@@ -522,6 +543,8 @@ class PublicSource:
         low = text.lower()
         if any(p in low for p in QUOTA_PHRASES):
             raise QuotaExceeded("구글 다운로드 제한 (짧은 시간에 요청이 많았던 파일)")
+        if any(p in low for p in BLOCKED_PHRASES):
+            raise DownloadBlocked(BLOCKED_MSG)
         if "accounts.google.com" in r.url or "servicelogin" in low:
             raise DownloadError("공개 파일이 아닙니다. 구글 로그인 후 다시 시도하세요")
         m = re.search(r'<form[^>]+id="download-form"[^>]+action="([^"]+)"', text)

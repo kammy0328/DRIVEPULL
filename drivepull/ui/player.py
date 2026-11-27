@@ -7,8 +7,8 @@ from PySide6.QtCore import QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
-from PySide6.QtWidgets import (QCheckBox, QDialog, QHBoxLayout, QLabel, QSlider, QStyle, QToolButton,
-                               QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QCheckBox, QDialog, QHBoxLayout, QLabel, QPushButton, QSlider, QStyle,
+                               QToolButton, QVBoxLayout, QWidget)
 
 from . import style
 from .grid import fmt_dur
@@ -68,14 +68,23 @@ class PlayerDialog(QDialog):
         v.addWidget(self.video, 1)
 
         # 버퍼링 표시 (영상 위)
-        self.overlay = QWidget(self.video)
+        # 영상 위젯의 자식으로 두면 영상 표면이 위에 그려서 안 보일 수 있음 → 창의 자식으로 두고 영상 위에 배치
+        self.overlay = QWidget(self)
+        self.overlay.setObjectName("ovl")
+        self.overlay.setAttribute(Qt.WA_StyledBackground, True)
         ol = QHBoxLayout(self.overlay)
         ol.setContentsMargins(14, 8, 14, 8)
         self.spin = Spinner(18)
         self.buf_lbl = QLabel("불러오는 중")
+        self.web_btn = QPushButton("드라이브 미리보기로 열기")
+        self.web_btn.setObjectName("primary")
+        self.web_btn.setCursor(Qt.PointingHandCursor)
+        self.web_btn.clicked.connect(self._open_web)
+        self.web_btn.hide()
         ol.addWidget(self.spin)
         ol.addWidget(self.buf_lbl)
-        self.overlay.setStyleSheet("background: rgba(0,0,0,170); border-radius: 10px;")
+        ol.addWidget(self.web_btn)
+        self.overlay.setStyleSheet("#ovl { background: rgba(20,22,27,235); border: 1px solid #2a2f38; border-radius: 10px; }")
         self.overlay.hide()
 
         bar = QWidget()
@@ -196,6 +205,10 @@ class PlayerDialog(QDialog):
         self.prev_btn.setEnabled(i > 0)
         self.next_btn.setEnabled(0 <= i < len(playlist) - 1)
         self._show_overlay("원본에 연결 중")
+        if it.blocked:
+            from ..drive import BLOCKED_MSG
+            self._show_error(BLOCKED_MSG)
+            return
         self.player.setSource(QUrl(self.url))
         self.player.play()
         self._rate_timer.start()
@@ -269,13 +282,28 @@ class PlayerDialog(QDialog):
         e = self.stream.entry_for(self.url)
         detail = e.error if e and e.error else msg
         log(f"플레이어 오류 {self.item.name if self.item else ''}: {msg} / {detail}")
-        self._show_overlay(f"재생할 수 없어요: {detail}", spinning=False)
+        self._show_error(detail)
 
-    def _show_overlay(self, text: str, spinning: bool = True):
+    def _show_error(self, detail: str):
+        from ..drive import BLOCKED_MSG
+        if detail == BLOCKED_MSG:
+            self._show_overlay("소유자가 다운로드를 막아둔 파일이라 원본으로 재생할 수 없어요.\n"
+                               "드라이브 미리보기(드라이브가 변환한 화질)로는 볼 수 있어요.", spinning=False, web=True)
+        else:
+            self._show_overlay(f"재생할 수 없어요: {detail}", spinning=False, web=True)
+
+    def _open_web(self):
+        from PySide6.QtGui import QDesktopServices
+        if self.item is not None:
+            QDesktopServices.openUrl(QUrl(f"https://drive.google.com/file/d/{self.item.id}/view"))
+
+    def _show_overlay(self, text: str, spinning: bool = True, web: bool = False):
+        self.web_btn.setVisible(web)
         self.buf_lbl.setText(text)
         self.overlay.adjustSize()
-        self.overlay.move((self.video.width() - self.overlay.width()) // 2,
-                          (self.video.height() - self.overlay.height()) // 2)
+        vg = self.video.geometry()
+        self.overlay.move(vg.x() + (vg.width() - self.overlay.width()) // 2,
+                          vg.y() + (vg.height() - self.overlay.height()) // 2)
         self.overlay.show()
         self.overlay.raise_()
         self.spin.start() if spinning else self.spin.stop()
@@ -286,6 +314,10 @@ class PlayerDialog(QDialog):
     def _update_rate(self):
         e = self.stream.entry_for(self.url)
         if not e:
+            return
+        if e.error and not self.web_btn.isVisible():
+            self.player.stop()
+            self._show_error(e.error)
             return
         pf = e.pf
         dur = self.player.duration()

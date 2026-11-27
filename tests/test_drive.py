@@ -26,3 +26,18 @@ def test_mac_hangul_nfd_to_nfc():
     nfd = unicodedata.normalize("NFD", "한글_촬영본_최종.mov")
     assert nfd != "한글_촬영본_최종.mov"            # 맥에서 올라온 이름 (자모 분리)
     assert safe_name(nfd) == "한글_촬영본_최종.mov"  # 받을 땐 조합형
+
+
+def test_blocked_page_detected():
+    """'소유자가 다운로드를 막음' 안내 페이지는 재시도하지 않고 바로 DownloadBlocked."""
+    import pytest
+    from drivepull.drive import DownloadBlocked, PublicSource
+
+    class R:
+        status_code = 200
+        url = "https://drive.usercontent.google.com/download?id=x"
+        text = ("<html><head><title>Google Drive - Can&#39;t download file</title></head><body>"
+                "Sorry, the owner hasn&#39;t given you permission to download this file. "
+                "Only the owner and editors can download this file.</body></html>").replace("&#39;", "'")
+    with pytest.raises(DownloadBlocked):
+        PublicSource("x")._check_html(R())

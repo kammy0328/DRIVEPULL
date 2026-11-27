@@ -409,6 +409,11 @@ class StreamServer:
                         resp.close()
 
             def _serve_prefetch(self, e, pf, start, end):
+                pf.set_want(start // PF_CHUNK)
+                first = pf.get(start // PF_CHUNK)
+                if first is None:
+                    self.send_error(502, "upstream error")
+                    return
                 self.send_response(206)
                 self.send_header("Content-Range", f"bytes {start}-{end}/{e.size}")
                 self.send_header("Accept-Ranges", "bytes")
