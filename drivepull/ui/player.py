@@ -139,7 +139,9 @@ class PlayerDialog(QDialog):
         self.player.mediaStatusChanged.connect(self._on_status)
         self.player.errorOccurred.connect(self._on_error)
 
-        self._rate_timer = QTimer(self, interval=1000, timeout=self._update_rate)
+        self._rate_timer = QTimer(self, interval=250, timeout=self._update_rate)
+        self._auto_paused = False
+        self._tick = 0
         for key, fn in ((Qt.Key_Space, self.toggle), (Qt.Key_Left, lambda: self.skip(-5000)),
                         (Qt.Key_Right, lambda: self.skip(5000)), (Qt.Key_Up, self.play_prev),
                         (Qt.Key_Down, self.play_next), (Qt.Key_M, self.toggle_mute),
@@ -170,6 +172,7 @@ class PlayerDialog(QDialog):
         ext = os.path.splitext(it.name)[1].lower()
         self.url = self.stream.register(lambda: self.source_for(it), it.size, MIME.get(ext, "video/quicktime"))
         self._last_bytes = 0
+        self._auto_paused = False
         self.name_lbl.setText(it.name)
         self.setWindowTitle(f"미리보기 · {it.name}")
         parts = []
@@ -183,7 +186,8 @@ class PlayerDialog(QDialog):
             self._mbps = mbps
         else:
             self._mbps = 0
-        self.info_lbl.setText(" · ".join(parts))
+        self._base_info = " · ".join(parts)
+        self.info_lbl.setText(self._base_info)
         self.pick.blockSignals(True)
         self.pick.setChecked(tree_item.checkState(0) == Qt.Checked)
         self.pick.blockSignals(False)
@@ -213,6 +217,11 @@ class PlayerDialog(QDialog):
 
     # ---- 조작
     def toggle(self):
+        if self._auto_paused:   # 버퍼링 대기 중 정지 누르면 그대로 정지 상태 유지
+            self._auto_paused = False
+            self.overlay.hide()
+            self.spin.stop()
+            return
         if self.player.playbackState() == QMediaPlayer.PlayingState:
             self.player.pause()
         else:
@@ -268,18 +277,44 @@ class PlayerDialog(QDialog):
         self.overlay.raise_()
         self.spin.start() if spinning else self.spin.stop()
 
+    PREBUF_SEC = 3.0      # 버퍼가 바닥나면 이만큼 쌓일 때까지 멈췄다가 재생 (자잘하게 끊기지 않게)
+    LOW_SEC = 0.4
+
     def _update_rate(self):
         e = self.stream.entry_for(self.url)
         if not e:
             return
-        rate = (e.bytes_sent - self._last_bytes) * 8 / 1e6   # Mbps
-        self._last_bytes = e.bytes_sent
-        if self.overlay.isVisible() and self.spin.isVisible():
-            msg = f"버퍼링 중 · {rate:,.0f} Mbps"
-            if self._mbps and rate and self._mbps > rate * 1.1:
-                msg += f" (원본 {self._mbps:,.0f} Mbps: 회선보다 높아 끊길 수 있어요)"
-            self.buf_lbl.setText(msg)
-            self.overlay.adjustSize()
+        pf = e.pf
+        dur = self.player.duration()
+        byterate = (e.size / (dur / 1000)) if (e.size and dur > 0) else 0.0
+        if pf is not None and byterate and pf.byterate != byterate:
+            pf.set_byterate(byterate)
+        if pf is None or not byterate:
+            return
+        pos_bytes = int(self.player.position() / 1000 * byterate)
+        ahead_sec = pf.ahead_of(pos_bytes) / byterate
+        remaining = max(0.0, (dur - self.player.position()) / 1000)
+        target = min(self.PREBUF_SEC, remaining)
+        playing = self.player.playbackState() == QMediaPlayer.PlayingState
+        if playing and not self._auto_paused and ahead_sec < min(self.LOW_SEC, target) and remaining > 1:
+            self._auto_paused = True
+            self.player.pause()
+        if self._auto_paused:
+            pct = int(min(1.0, ahead_sec / target if target else 1) * 100)
+            msg = f"버퍼링 {pct}% · 수신 {pf.rate * 8 / 1e6:,.0f} Mbps / 원본 {byterate * 8 / 1e6:,.0f} Mbps"
+            if pf.rate and pf.rate < byterate * 0.95:
+                msg += "\n회선이 원본보다 느려서 중간중간 버퍼링이 필요해요"
+            self._show_overlay(msg)
+            if ahead_sec >= target:
+                self._auto_paused = False
+                self.overlay.hide()
+                self.spin.stop()
+                self.player.play()
+        self._tick += 1
+        if self._tick % 4 == 0:
+            self.info_lbl.setText(
+                f"{self._base_info} · 수신 {pf.rate * 8 / 1e6:,.0f} / 원본 {byterate * 8 / 1e6:,.0f} Mbps"
+                f" · 버퍼 {ahead_sec:,.1f}초 · 연결 {len(pf.workers)}")
 
     def resizeEvent(self, e):
         super().resizeEvent(e)

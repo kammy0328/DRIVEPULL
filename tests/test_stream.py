@@ -109,3 +109,45 @@ def test_player_plays_and_seeks_prores(upstream):
     assert state["before"] > 5                     # 재생되며 프레임이 나옴
     assert len(frames) > state["before"]           # 탐색 후에도 계속 나옴
     assert state["pos"] >= 1500
+
+
+class SlowUp(Up):
+    """연결당 0.4MB/s, 요청마다 첫 응답 0.2초 (구글처럼 연결당 속도 제한)."""
+    def do_GET(self):
+        a, b = self.headers["Range"].split("=")[1].split("-")
+        s, e = int(a), (int(b) if b else len(DATA) - 1)
+        time.sleep(0.2)
+        self.send_response(206)
+        self.send_header("Content-Range", f"bytes {s}-{e}/{len(DATA)}")
+        self.send_header("Content-Length", str(e - s + 1))
+        self.end_headers()
+        pos, t0 = s, time.monotonic()
+        try:
+            while pos <= e:
+                n = min(32 * 1024, e - pos + 1)
+                self.wfile.write(DATA[pos:pos + n])
+                pos += n
+                ahead = (pos - s) / 400_000 - (time.monotonic() - t0)
+                if ahead > 0:
+                    time.sleep(ahead)
+        except OSError:
+            pass
+
+
+def test_prefetch_uses_parallel_connections(monkeypatch):
+    """연결 하나면 1.3MB / 0.4MB/s ≈ 3.4초. 여러 연결로 미리 받으면 훨씬 빨라야 함."""
+    import requests
+
+    import drivepull.stream as S
+    monkeypatch.setattr(S, "PF_CHUNK", 64 * 1024)
+    s = ThreadingHTTPServer(("127.0.0.1", 0), SlowUp)
+    threading.Thread(target=s.serve_forever, daemon=True).start()
+    srv = StreamServer()
+    url = srv.register(lambda: Src(f"http://127.0.0.1:{s.server_address[1]}/"), len(DATA), "video/quicktime")
+    t0 = time.monotonic()
+    r = requests.get(url, headers={"Range": "bytes=0-"}, timeout=30)
+    took = time.monotonic() - t0
+    srv.shutdown()
+    s.shutdown()
+    assert r.content == DATA
+    assert took < 2.0, f"{took:.1f}초"
