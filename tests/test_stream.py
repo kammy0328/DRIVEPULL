@@ -151,3 +151,59 @@ def test_prefetch_uses_parallel_connections(monkeypatch):
     s.shutdown()
     assert r.content == DATA
     assert took < 2.0, f"{took:.1f}초"
+
+
+class BigUp(BaseHTTPRequestHandler):
+    """메모리에 안 담는 큰 가상 파일 (바이트 i = i % 251). 40GB 원본처럼 버퍼보다 훨씬 큰 파일 흉내."""
+    protocol_version = "HTTP/1.1"
+    SIZE = 400 * 1024 * 1024
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        a, b = self.headers["Range"].split("=")[1].split("-")
+        s, e = int(a), (int(b) if b else self.SIZE - 1)
+        self.send_response(206)
+        self.send_header("Content-Range", f"bytes {s}-{e}/{self.SIZE}")
+        self.send_header("Content-Length", str(e - s + 1))
+        self.end_headers()
+        pos = s
+        try:
+            while pos <= e:
+                n = min(256 * 1024, e - pos + 1)
+                self.wfile.write(bytes((pos + k) % 251 for k in range(n)))
+                pos += n
+        except OSError:
+            pass
+
+
+def _pattern(start, n):
+    return bytes((start + k) % 251 for k in range(n))
+
+
+def test_far_reads_on_big_file(monkeypatch):
+    """버퍼 범위 밖(파일 끝의 moov, 멀리 탐색)을 읽어도 멈추지 않아야 함 (v0.6.1 재생 안 됨 버그)."""
+    import requests
+
+    import drivepull.stream as S
+    monkeypatch.setattr(S, "PF_CHUNK", 256 * 1024)
+    monkeypatch.setattr(S, "PF_CACHE", 2 * 1024 * 1024)       # 버퍼 8조각
+    s = ThreadingHTTPServer(("127.0.0.1", 0), BigUp)
+    threading.Thread(target=s.serve_forever, daemon=True).start()
+    srv = StreamServer()
+    size = BigUp.SIZE
+    url = srv.register(lambda: Src(f"http://127.0.0.1:{s.server_address[1]}/"), size, "video/quicktime")
+    # 1) 처음부터 재생 흐름
+    r = requests.get(url, headers={"Range": "bytes=0-1048575"}, timeout=10)
+    assert r.content == _pattern(0, 1048576)
+    # 2) 파일 끝 쪽 moov 읽기 (끝에서 3MB 지점부터 1MB: 마지막 2조각보다 앞)
+    a = size - 3 * 1024 * 1024
+    r = requests.get(url, headers={"Range": f"bytes={a}-{a + 1048575}"}, timeout=10)
+    assert r.content == _pattern(a, 1048576)
+    # 3) 파일 중간으로 탐색 (버퍼 범위 훨씬 밖)
+    a = size // 2 + 12345
+    r = requests.get(url, headers={"Range": f"bytes={a}-{a + 2 * 1048576}"}, timeout=10)
+    assert r.content == _pattern(a, 2 * 1048576 + 1)
+    srv.shutdown()
+    s.shutdown()

@@ -170,7 +170,8 @@ class PlayerDialog(QDialog):
         self.item = it = tree_item.data(0, ITEM_ROLE)
         self.playlist = playlist
         ext = os.path.splitext(it.name)[1].lower()
-        self.url = self.stream.register(lambda: self.source_for(it), it.size, MIME.get(ext, "video/quicktime"))
+        self.url = self.stream.register(lambda: self.source_for(it), it.size, MIME.get(ext, "video/quicktime"),
+                                        it.name)
         self._last_bytes = 0
         self._auto_paused = False
         self.name_lbl.setText(it.name)
@@ -264,8 +265,10 @@ class PlayerDialog(QDialog):
             self.spin.stop()
 
     def _on_error(self, _err, msg):
+        from ..stream import log
         e = self.stream.entry_for(self.url)
         detail = e.error if e and e.error else msg
+        log(f"플레이어 오류 {self.item.name if self.item else ''}: {msg} / {detail}")
         self._show_overlay(f"재생할 수 없어요: {detail}", spinning=False)
 
     def _show_overlay(self, text: str, spinning: bool = True):

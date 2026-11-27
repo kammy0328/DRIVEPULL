@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 import secrets
+from collections import OrderedDict
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -18,12 +19,26 @@ import requests
 from .engine import DownloadError, TransientError, make_session
 
 RELAY_CHUNK = 256 * 1024
+
+
+def log(msg: str) -> None:
+    """%APPDATA%\\DRIVEPULL\\player.log (재생 문제 진단용, 1MB 넘으면 새로)."""
+    try:
+        from .config import app_dir
+        p = app_dir() / "player.log"
+        if p.exists() and p.stat().st_size > 1 << 20:
+            p.unlink()
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + msg + "\n")
+    except OSError:
+        pass
 PF_CHUNK = 4 << 20          # 미리 받기 단위 4MB
 PF_CONNS = 8                # 시작 연결 수 (구글은 연결당 속도 제한이 있어서 여러 개로 받아야 원본 속도가 나옴)
 PF_MAX_CONNS = 32           # 원본이 무거우면 여기까지 늘림
 PF_CACHE = 768 << 20        # 메모리 버퍼 기본 768MB
 PF_CACHE_MAX = 3 << 30      # 고비트레이트 원본은 최대 3GB (약 10초 분량 목표)
 PF_BEHIND = 2               # 재생 위치 뒤로 남겨둘 조각 (짧게 되감기용)
+PF_SIDE = 16                # 범위 밖 조각 보조 캐시 (64MB)
 PF_REGION = 8               # 요청 하나로 이어 받을 조각 수 (32MB)
 
 
@@ -36,6 +51,8 @@ class Prefetcher:
         self.n_chunks = (self.size + PF_CHUNK - 1) // PF_CHUNK
         self.ahead = max(4, cache // PF_CHUNK)
         self.chunks: dict[int, bytes] = {}
+        self.side: "OrderedDict[int, bytes]" = OrderedDict()
+        self.pins: dict[int, int] = {}
         self.inflight: set[int] = set()
         self.urgent: list[int] = []
         self.want = 0                    # 주 재생 흐름이 지금 읽는 조각
@@ -197,11 +214,13 @@ class Prefetcher:
                         raise TransientError("응답이 중간에 끊김")
                 except DownloadError as ex:
                     self.e.error = str(ex)
+                    log(f"오류 {self.e.name}: {ex}")
                     break
                 except (TransientError, requests.RequestException, OSError) as ex:
                     self.errors += 1
                     if getattr(ex, "throttle", False):
                         self.throttled += 1
+                    log(f"재시도 {self.e.name} 조각 {pending[0] if pending else '-'}: {ex!r}")
                     attempt += 1
                     if attempt > 6:
                         break
@@ -217,35 +236,55 @@ class Prefetcher:
             # moov 등 파일 끝 쪽(마지막 2조각)은 자주 다시 읽어서 남겨둔다
             if i >= self.n_chunks - 2:
                 continue
-            del self.chunks[i]
+            # 플레이어가 기다리고 있는 조각은 절대 지우지 않음 (지우면 다시 받고 또 지우는 무한 반복)
+            if self.pins.get(i):
+                continue
+            # 범위 밖으로 밀려난 조각은 작은 보조 캐시에 잠시 보관 (moov ↔ 본문 왔다 갔다 할 때 재다운로드 방지)
+            self.side[i] = self.chunks.pop(i)
+            self.side.move_to_end(i)
+            while len(self.side) > PF_SIDE:
+                self.side.popitem(last=False)
 
     def get(self, idx: int, timeout: float = 60.0) -> Optional[bytes]:
         with self.cond:
-            if idx not in self.chunks and idx not in self.inflight and idx not in self.urgent:
-                self.urgent.append(idx)
-                self.cond.notify_all()
-            end = time.monotonic() + timeout
-            while idx not in self.chunks:
-                if self.stop.is_set() or self.e.error:
-                    return None
-                left = end - time.monotonic()
-                if left <= 0:
-                    return None
-                if idx not in self.inflight and idx not in self.urgent:
+            if idx in self.side:
+                self.side.move_to_end(idx)
+                return self.side[idx]
+            self.pins[idx] = self.pins.get(idx, 0) + 1
+            try:
+                if idx not in self.chunks and idx not in self.inflight and idx not in self.urgent:
                     self.urgent.append(idx)
                     self.cond.notify_all()
-                self.cond.wait(min(left, 0.5))
-            return self.chunks[idx]
+                end = time.monotonic() + timeout
+                while idx not in self.chunks:
+                    if self.stop.is_set() or self.e.error:
+                        return None
+                    left = end - time.monotonic()
+                    if left <= 0:
+                        self.e.error = self.e.error or "원본 응답 없음 (60초)"
+                        log(f"시간 초과 {self.e.name} 조각 {idx} want={self.want} inflight={sorted(self.inflight)[:8]}")
+                        return None
+                    if idx not in self.inflight and idx not in self.urgent:
+                        self.urgent.append(idx)
+                        self.cond.notify_all()
+                    self.cond.wait(min(left, 0.5))
+                return self.chunks[idx]
+            finally:
+                self.pins[idx] -= 1
+                if not self.pins[idx]:
+                    del self.pins[idx]
 
     def close(self) -> None:
         self.stop.set()
         with self.cond:
             self.cond.notify_all()
             self.chunks.clear()
+            self.side.clear()
 
 
 class _Entry:
-    def __init__(self, source_factory: Callable[[], object], size: Optional[int], mime: str):
+    def __init__(self, source_factory: Callable[[], object], size: Optional[int], mime: str, name: str = ""):
+        self.name = name
         self.factory = source_factory
         self.source = None
         self.size = size
@@ -360,6 +399,7 @@ class StreamServer:
                     pass   # 플레이어가 탐색하면서 연결을 끊은 것: 정상
                 except (DownloadError, TransientError, requests.RequestException, OSError) as ex:
                     e.error = str(ex) or ex.__class__.__name__
+                    log(f"오류(직접 중계) {e.name}: {ex!r}")
                     try:
                         self.send_error(502, "upstream error")
                     except OSError:
@@ -376,14 +416,11 @@ class StreamServer:
                 self.send_header("Content-Length", str(end - start + 1))
                 self.end_headers()
                 pos = start
-                seq = 0
                 try:
                     while pos <= end:
                         idx = pos // PF_CHUNK
-                        seq += 1
-                        if seq >= 2:
-                            # 연속으로 여러 조각을 읽는 쪽이 실제 재생 흐름 (moov 읽기 같은 짧은 요청은 제외)
-                            pf.set_want(idx)
+                        # 지금 읽고 있는 위치를 기준으로 앞쪽을 미리 받음 (탐색하면 바로 그쪽으로 이동)
+                        pf.set_want(idx)
                         data = pf.get(idx)
                         if data is None:
                             break
@@ -408,9 +445,11 @@ class StreamServer:
             s = self._local.s = make_session()
         return s
 
-    def register(self, source_factory: Callable[[], object], size: Optional[int], mime: str = "") -> str:
+    def register(self, source_factory: Callable[[], object], size: Optional[int], mime: str = "",
+                 name: str = "") -> str:
         token = secrets.token_urlsafe(12)
-        self.entries[token] = _Entry(source_factory, size, mime)
+        self.entries[token] = _Entry(source_factory, size, mime, name)
+        log(f"재생 시작 {name} ({size} bytes)")
         return f"http://127.0.0.1:{self.port}/v/{token}"
 
     def entry_for(self, url: str) -> Optional[_Entry]:
