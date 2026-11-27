@@ -72,6 +72,19 @@ def parse_link(text: str) -> Optional[DriveLink]:
     return None
 
 
+def parse_links(text: str) -> list[DriveLink]:
+    """붙여넣은 글에서 드라이브 링크를 모두 찾는다 (줄바꿈·공백·쉼표로 구분). 같은 항목은 한 번만."""
+    found, seen = [], set()
+    urls = re.findall(r"https?://[^\s,;<>\"']+", text)
+    candidates = urls if urls else [x for x in re.split(r"[\s,;]+", text) if x]
+    for u in candidates:
+        lk = parse_link(u)
+        if lk and lk.id not in seen:
+            seen.add(lk.id)
+            found.append(lk)
+    return found
+
+
 # ---------------------------------------------------------------- 항목
 @dataclass
 class DriveItem:
@@ -92,6 +105,7 @@ class DriveItem:
     duration_ms: int = 0
     modified: str = ""   # ISO 시각 (API 모드만)
     blocked: bool = False   # 소유자가 보기 전용으로 다운로드를 막아둔 파일
+    virtual: bool = False   # 링크 여러 개를 묶은 가상 폴더 (저장 경로에 이름을 넣지 않음)
 
     def walk_files(self):
         if self.is_folder:
@@ -443,7 +457,15 @@ def _filename_from_cd(cd: str) -> Optional[str]:
         from urllib.parse import unquote
         return unquote(m.group(1))
     m = re.search(r'filename="([^"]+)"', cd)
-    return m.group(1) if m else None
+    if not m:
+        return None
+    name = m.group(1)
+    try:
+        # 헤더는 latin-1 로 읽히지만 구글은 UTF-8 바이트를 그대로 보냄 → 한글이 깨져 보임
+        name = name.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        pass
+    return unicodedata.normalize("NFC", name)
 
 
 def _probe_from_response(r: requests.Response) -> ProbeResult:

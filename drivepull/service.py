@@ -2,12 +2,18 @@
 from __future__ import annotations
 
 import os
+import re
 from typing import Iterable
 
 from .auth import GoogleAuth
 from .config import QUEUE_PATH, Settings
 from .drive import ApiSource, DriveAPI, DriveItem, PublicSource
 from .engine import DownloadError, DownloadManager, Task
+
+
+def underscore(name: str) -> str:
+    """폴더 이름 띄어쓰기를 _ 로 (연속 공백은 _ 하나, 앞뒤 공백 제거)."""
+    return re.sub(r"\s+", "_", name.strip()) or name
 
 
 class Service:
@@ -70,6 +76,8 @@ class Service:
             if it.is_folder or it.unsupported:
                 continue
             if self.settings.keep_folder_structure:
+                if self.settings.folder_underscore and rel_dir:
+                    rel_dir = os.path.join(*[underscore(x) for x in rel_dir.split(os.sep)])
                 dest = os.path.join(save_dir, rel_dir, it.name)
             else:
                 dest = os.path.join(save_dir, it.name)

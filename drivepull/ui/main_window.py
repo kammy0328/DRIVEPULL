@@ -14,7 +14,8 @@ from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QCheckBox, QComb
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 
 from ..config import APP_NAME, APP_VERSION, Settings
-from ..drive import DriveItem, DriveLink, list_api, list_public, parse_link, probe_public_sizes
+from ..drive import DriveItem, DriveLink, list_api, list_public, parse_links, probe_public_sizes
+from ..power import keep_awake
 from ..engine import STATUS_LABEL, UNFINISHED, DownloadError
 from ..service import Service
 from . import style
@@ -153,6 +154,10 @@ class MainWindow(QMainWindow):
         self._update_account()
         self._summary_timer = QTimer(self, singleShot=True, interval=80, timeout=self._update_summary)
         self._folder_timer = QTimer(self, singleShot=True, interval=300, timeout=self._recalc_folder_sizes)
+        self._batch: set[str] = set()       # 이번에 받은 묶음 (끝나면 알림)
+        self._batch_active = False
+        self.tray = None
+        self._init_tray()
         self._dl_timer = QTimer(self, interval=400, timeout=self._refresh_downloads)
         self._dl_timer.start()
         self._refresh_downloads()
@@ -353,7 +358,13 @@ class MainWindow(QMainWindow):
         self.keep_struct = QCheckBox("폴더 구조 유지")
         self.keep_struct.setChecked(self.s.keep_folder_structure)
         self.keep_struct.toggled.connect(self._keep_struct_changed)
+        self.underscore = QCheckBox("띄어쓰기 → _")
+        self.underscore.setToolTip("저장할 때 폴더 이름의 띄어쓰기를 _ 로 바꿈 (예: 업로드 가능_티저 → 업로드_가능_티저)")
+        self.underscore.setChecked(self.s.folder_underscore)
+        self.underscore.setEnabled(self.s.keep_folder_structure)
+        self.underscore.toggled.connect(self._underscore_changed)
         bl.addWidget(self.keep_struct)
+        bl.addWidget(self.underscore)
         self.sel_lbl = QLabel("")
         self.sel_lbl.setObjectName("muted")
         bl.addWidget(self.sel_lbl)
@@ -499,14 +510,21 @@ class MainWindow(QMainWindow):
     # ================================================================ 목록 불러오기
     def _on_link_edited(self, text: str):
         pasted = len(text) - len(self._prev_text) > 15
+        if "\n" in text or "\r" in text:
+            # 여러 줄로 붙여넣은 링크는 한 줄로 보기 좋게 (줄바꿈 → 공백 두 칸)
+            links = parse_links(text)
+            text = "  ".join(f"https://drive.google.com/{'drive/folders' if lk.kind == 'folder' else 'file/d'}/{lk.id}"
+                             + (f"?resourcekey={lk.resource_key}" if lk.resource_key else "")
+                             if lk.kind != "unknown" else lk.id for lk in links) if links else text.replace("\n", " ")
+            self.link.setText(text)
         self._prev_text = text
-        if pasted and parse_link(text):
+        if pasted and parse_links(text):
             self._load()
 
     def _load(self):
         text = self.link.text().strip()
-        link = parse_link(text)
-        if link is None:
+        links = parse_links(text)
+        if not links:
             self._toast("구글 드라이브 링크가 아니에요. 공유 링크를 그대로 붙여넣어 주세요.", error=True)
             return
         if self._cancel:
@@ -529,30 +547,45 @@ class MainWindow(QMainWindow):
         self.sel_lbl.setText("")
         api = self.svc.api()
 
+        def list_one(link, prog):
+            if api.usable:
+                return list_api(api, link, prog, cancel)
+            if link.kind == "unknown":
+                try:
+                    return list_public(DriveLink("folder", link.id, link.resource_key), prog, cancel)
+                except DownloadError:
+                    return list_public(DriveLink("file", link.id, link.resource_key), prog, cancel)
+            return list_public(link, prog, cancel)
+
         def run():
-            try:
-                prog = lambda n: self.bridge.count.emit(n, req)  # noqa: E731
-                if api.usable:
-                    root = list_api(api, link, prog, cancel)
-                else:
-                    lk = link
-                    if link.kind == "unknown":
-                        lk = DriveLink("folder", link.id, link.resource_key)
-                        try:
-                            root = list_public(lk, prog, cancel)
-                        except DownloadError:
-                            root = list_public(DriveLink("file", link.id, link.resource_key), prog, cancel)
-                    else:
-                        root = list_public(lk, prog, cancel)
-                self.bridge.listed.emit(root, "", req)
-                if not api.usable and not cancel.is_set():
-                    files = [f for f in root.walk_files() if f.size is None]
-                    probe_public_sizes(files, lambda it: self.bridge.size_found.emit(it.id, it.size), cancel)
-            except Exception as e:  # noqa: BLE001
-                msg = str(e) or e.__class__.__name__
-                if not api.usable and not self.svc.auth.logged_in:
-                    msg += "  (비공개 폴더라면 오른쪽 위에서 구글 로그인 후 다시 불러오세요)"
-                self.bridge.listed.emit(None, msg, req)
+            hint = "  (비공개 폴더라면 오른쪽 위에서 구글 로그인 후 다시 불러오세요)" \
+                if not api.usable and not self.svc.auth.logged_in else ""
+            base = [0]
+            prog = lambda n: self.bridge.count.emit(base[0] + n, req)  # noqa: E731
+            roots, errors = [], []
+            for i, link in enumerate(links, 1):
+                if cancel.is_set():
+                    return
+                try:
+                    r = list_one(link, prog)
+                    roots.append(r)
+                    base[0] += sum(1 for _ in r.walk_files())
+                except Exception as e:  # noqa: BLE001
+                    errors.append(f"{i}번째 링크: {str(e) or e.__class__.__name__}")
+            if not roots:
+                self.bridge.listed.emit(None, " / ".join(errors) + hint, req)
+                return
+            if len(roots) == 1:
+                root = roots[0]
+            else:
+                # 링크 여러 개는 가상 폴더 하나로 묶음 (저장 경로에는 이 이름을 넣지 않음)
+                root = DriveItem(id="__links__", name=f"링크 {len(roots)}개", is_folder=True,
+                                 children=roots, virtual=True,
+                                 mode="api" if all(r.mode == "api" for r in roots) else "public")
+            self.bridge.listed.emit(root, (" / ".join(errors) + hint) if errors else "", req)
+            if not api.usable and not cancel.is_set():
+                files = [f for f in root.walk_files() if f.size is None]
+                probe_public_sizes(files, lambda it: self.bridge.size_found.emit(it.id, it.size), cancel)
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -565,11 +598,13 @@ class MainWindow(QMainWindow):
             return
         self.list_spin.stop()
         self.load_btn.setEnabled(True)
-        if err or root is None:
+        if root is None:
             self.root_lbl.setText("목록을 불러오지 못했어요")
             self.count_lbl.setText("")
             self._toast(err, error=True)
             return
+        if err:
+            self._toast(f"일부 링크를 불러오지 못했어요: {err}", error=True)
         self.root_item = root
         self.grid.set_root(None)
         self.tree.blockSignals(True)
@@ -688,7 +723,9 @@ class MainWindow(QMainWindow):
             parts = []
             p = q.parent()
             while p is not None:
-                parts.append(p.data(0, ITEM_ROLE).name)
+                pi = p.data(0, ITEM_ROLE)
+                if not pi.virtual:   # 링크 묶음 가상 폴더 이름은 저장 경로에 넣지 않음
+                    parts.append(pi.name)
                 p = p.parent()
             out.append((it, os.path.join(*reversed(parts)) if parts else ""))
         return out
@@ -859,6 +896,11 @@ class MainWindow(QMainWindow):
 
     def _keep_struct_changed(self, on: bool):
         self.s.keep_folder_structure = on
+        self.underscore.setEnabled(on)
+        self.s.save()
+
+    def _underscore_changed(self, on: bool):
+        self.s.folder_underscore = on
         self.s.save()
 
     def _start_download(self):
@@ -878,6 +920,7 @@ class MainWindow(QMainWindow):
     # ================================================================ 다운로드 목록
     def _refresh_downloads(self):
         tasks = self.svc.manager.snapshot()
+        self._track_batch(tasks)
         uids = {t.uid for t in tasks}
         for uid in list(self._dl_rows):
             if uid not in uids:
@@ -986,6 +1029,60 @@ class MainWindow(QMainWindow):
                 mgr.remove(uids)
         self._refresh_downloads()
 
+    # ================================================================ 절전 방지 · 완료 알림
+    def _init_tray(self):
+        from PySide6.QtWidgets import QSystemTrayIcon
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        from PySide6.QtWidgets import QApplication
+        self.tray = QSystemTrayIcon(QApplication.windowIcon() or self.windowIcon(), self)
+        self.tray.setToolTip("DRIVEPULL")
+        self.tray.messageClicked.connect(self._bring_front)
+        self.tray.activated.connect(lambda *_: self._bring_front())
+        self.tray.show()
+
+    def _bring_front(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+        self._switch_page(1)
+
+    def _track_batch(self, tasks):
+        """받기가 하나라도 진행 중이면 절전 방지, 모두 끝나면 해제하고 완료 알림."""
+        busy = [t for t in tasks if t.status in RUNNING or t.status in ("queued", "waiting")]
+        for t in busy:
+            self._batch.add(t.uid)
+        if busy and not self._batch_active:
+            self._batch_active = True
+            if self.s.keep_awake:
+                keep_awake(True)
+        elif not busy and self._batch_active:
+            self._batch_active = False
+            keep_awake(False)
+            self._notify_batch(tasks)
+            self._batch.clear()
+
+    def _notify_batch(self, tasks):
+        mine = [t for t in tasks if t.uid in self._batch]
+        done = [t for t in mine if t.status in ("done", "skipped")]
+        errs = [t for t in mine if t.status == "error"]
+        paused = [t for t in mine if t.status in ("paused", "canceled")]
+        if not done and not errs:
+            return   # 사용자가 멈추거나 취소만 한 경우는 알리지 않음
+        title = "다운로드 완료" if not errs else "다운로드 끝 (오류 있음)"
+        msg = f"{len(done)}개 파일 · {fmt_size(sum(t.size or 0 for t in done))}"
+        if errs:
+            msg += f"\n오류 {len(errs)}개: {errs[0].name}" + (" 외" if len(errs) > 1 else "")
+        if paused:
+            msg += f"\n일시정지·취소 {len(paused)}개"
+        if self.s.notify_done and self.tray is not None:
+            from PySide6.QtWidgets import QSystemTrayIcon
+            self.tray.showMessage(title, msg, QSystemTrayIcon.Warning if errs else QSystemTrayIcon.Information,
+                                  10000)
+        from PySide6.QtWidgets import QApplication
+        QApplication.alert(self, 0)   # 작업 표시줄 아이콘 깜빡임
+        self._last_notice = (title, msg)
+
     def _row_action(self, action: str, uid: str):
         mgr = self.svc.manager
         t = mgr.get(uid)
@@ -1090,6 +1187,9 @@ class MainWindow(QMainWindow):
         if self._cancel:
             self._cancel.set()
         self.loader.shutdown()
+        keep_awake(False)
+        if self.tray is not None:
+            self.tray.hide()
         if getattr(self, "player", None) is not None:
             self.player.close()
         if getattr(self, "stream", None) is not None:

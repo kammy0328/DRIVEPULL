@@ -41,3 +41,32 @@ def test_blocked_page_detected():
                 "Only the owner and editors can download this file.</body></html>").replace("&#39;", "'")
     with pytest.raises(DownloadBlocked):
         PublicSource("x")._check_html(R())
+
+
+def test_parse_links_multi():
+    from drivepull.drive import parse_links
+    text = ("https://drive.google.com/drive/folders/1GEtdvNV4DWynfk4s7IFyR1swr_MYRpQs\n"
+            "https://drive.google.com/file/d/1uZ5MjTDOAHExn1tQ_7eEn258T5eYux5N/view?usp=sharing\r\n"
+            "  https://drive.google.com/drive/folders/1GEtdvNV4DWynfk4s7IFyR1swr_MYRpQs ,"   # 중복
+            " https://drive.google.com/open?id=1EsqEXnOPfYgiTuIfqZPeXmlRED7NlPZG")
+    ls = parse_links(text)
+    assert [(x.kind, x.id) for x in ls] == [
+        ("folder", "1GEtdvNV4DWynfk4s7IFyR1swr_MYRpQs"),
+        ("file", "1uZ5MjTDOAHExn1tQ_7eEn258T5eYux5N"),
+        ("unknown", "1EsqEXnOPfYgiTuIfqZPeXmlRED7NlPZG"),
+    ]
+    assert parse_links("그냥 글자") == []
+
+
+def test_underscore():
+    from drivepull.service import underscore
+    assert underscore("업로드 가능_티저") == "업로드_가능_티저"
+    assert underscore("  A   B  ") == "A_B"
+
+
+def test_content_disposition_korean():
+    import unicodedata
+    from drivepull.drive import _filename_from_cd
+    raw = unicodedata.normalize("NFD", "1102_LCK_Teaser_가로_6s.mp4").encode("utf-8").decode("latin-1")
+    assert _filename_from_cd(f'attachment; filename="{raw}"') == "1102_LCK_Teaser_가로_6s.mp4"
+    assert _filename_from_cd("attachment; filename*=UTF-8''%ED%95%9C%EA%B8%80.mov") == "한글.mov"

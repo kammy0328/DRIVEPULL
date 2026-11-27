@@ -9,7 +9,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 APP_NAME = "DRIVEPULL"
-APP_VERSION = "0.6.4"
+APP_VERSION = "0.7.0"
 
 
 def app_dir() -> Path:
@@ -39,6 +39,9 @@ class Settings:
     quota_copy_fallback: bool = True
     keep_folder_structure: bool = True
     cleanup_on_exit: bool = True     # 종료 시 받다 만 파일 정리
+    folder_underscore: bool = True   # 저장할 때 폴더 이름의 띄어쓰기를 _ 로
+    keep_awake: bool = True          # 다운로드 중 PC 절전 방지
+    notify_done: bool = True         # 다운로드 끝나면 Windows 알림
     sort_key: str = "name"           # name | size | type | modified
     sort_desc: bool = False
     api_key: str = ""
