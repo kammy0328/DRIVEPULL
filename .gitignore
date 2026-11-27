@@ -7,3 +7,4 @@ dist/
 drivepull/_client_config.py
 client_secret*.json
 token.json
+*.selftest.txt

@@ -190,6 +190,41 @@ def make_icon(kind: str, color: str = "#c9ced8", size: int = 16):
         path.lineTo(s * 0.15, s * 0.25)
         path.closeSubpath()
         p.drawPath(path)
+    elif kind in ("prev", "next"):
+        p.setPen(Qt.NoPen)
+        p.setBrush(c)
+        path = QPainterPath()
+        if kind == "next":
+            path.moveTo(s * 0.22, s * 0.2)
+            path.lineTo(s * 0.22, s * 0.8)
+            path.lineTo(s * 0.66, s * 0.5)
+            p.drawRect(QRectF(s * 0.68, s * 0.2, s * 0.12, s * 0.6))
+        else:
+            path.moveTo(s * 0.78, s * 0.2)
+            path.lineTo(s * 0.78, s * 0.8)
+            path.lineTo(s * 0.34, s * 0.5)
+            p.drawRect(QRectF(s * 0.2, s * 0.2, s * 0.12, s * 0.6))
+        path.closeSubpath()
+        p.drawPath(path)
+    elif kind in ("volume", "muted"):
+        p.setPen(Qt.NoPen)
+        p.setBrush(c)
+        path = QPainterPath(QPointF(s * 0.12, s * 0.38))
+        path.lineTo(s * 0.3, s * 0.38)
+        path.lineTo(s * 0.52, s * 0.18)
+        path.lineTo(s * 0.52, s * 0.82)
+        path.lineTo(s * 0.3, s * 0.62)
+        path.lineTo(s * 0.12, s * 0.62)
+        path.closeSubpath()
+        p.drawPath(path)
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+        if kind == "volume":
+            p.drawArc(QRectF(s * 0.42, s * 0.3, s * 0.3, s * 0.4), -50 * 16, 100 * 16)
+            p.drawArc(QRectF(s * 0.4, s * 0.16, s * 0.48, s * 0.68), -50 * 16, 100 * 16)
+        else:
+            p.drawLine(QPointF(s * 0.64, s * 0.36), QPointF(s * 0.88, s * 0.64))
+            p.drawLine(QPointF(s * 0.88, s * 0.36), QPointF(s * 0.64, s * 0.64))
     elif kind in ("asc", "desc"):
         p.setPen(pen)
         y1, y2 = (s * 0.2, s * 0.8) if kind == "asc" else (s * 0.8, s * 0.2)

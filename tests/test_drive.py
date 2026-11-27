@@ -19,3 +19,10 @@ def test_entry_regex():
     h = ('<div class="flip-entry" id="entry-1abcdefghijk" tabindex="0"><div class="flip-entry-info">'
          '<a href="https://drive.google.com/drive/folders/1abcdefghijk" target="_blank"><div class="flip-entry-title">Day&#39;1</div>')
     assert _ENTRY.findall(h) == [("1abcdefghijk", "https://drive.google.com/drive/folders/1abcdefghijk", "Day&#39;1")]
+
+
+def test_mac_hangul_nfd_to_nfc():
+    import unicodedata
+    nfd = unicodedata.normalize("NFD", "한글_촬영본_최종.mov")
+    assert nfd != "한글_촬영본_최종.mov"            # 맥에서 올라온 이름 (자모 분리)
+    assert safe_name(nfd) == "한글_촬영본_최종.mov"  # 받을 땐 조합형

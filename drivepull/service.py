@@ -37,6 +37,11 @@ class Service:
             return PublicSource(s["id"], s.get("rk", ""))
         return ApiSource(self.api(), s["id"], s.get("rk", ""), s.get("export"))
 
+    def source_for_item(self, it: DriveItem):
+        """미리보기 재생용 소스 (다운로드와 같은 규칙: 로그인했으면 API, 아니면 공개 링크)."""
+        fake = Task(name=it.name, dest="", source={"mode": it.mode, "id": it.id, "rk": it.resource_key})
+        return self._source_for(fake)
+
     def _quota_fallback(self, t: Task, err):
         """할당량 초과 파일을 내 드라이브에 사본으로 만든 뒤 사본을 받는다."""
         if not self.auth.logged_in:

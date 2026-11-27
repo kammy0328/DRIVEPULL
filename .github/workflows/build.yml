@@ -47,6 +47,16 @@ jobs:
           --hidden-import drivepull._client_config
           run.py
 
+      # 빌드된 exe 로 ProRes 4444 샘플을 실제로 재생해서 영상 디코더가 포함됐는지 확인
+      - name: Exe player selftest
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          $p = Start-Process -FilePath dist\DRIVEPULL.exe -ArgumentList "--selftest-player","tests\data\prores4444_moov_end.mov" -Wait -PassThru
+          Get-Content tests\data\prores4444_moov_end.mov.selftest.txt
+          if ($p.ExitCode -ne 0) { throw "player selftest failed: $($p.ExitCode)" }
+
       - uses: actions/upload-artifact@v4
         with:
           name: DRIVEPULL-windows

@@ -327,6 +327,8 @@ class MainWindow(QMainWindow):
         space.triggered.connect(self._toggle_selected)
         self.tree.addAction(space)
         self.grid = ThumbGrid(self.loader)
+        self.grid.play_requested.connect(self.play_item)
+        self.tree.itemDoubleClicked.connect(self._tree_double)
         self.view_stack = QStackedWidget()
         self.view_stack.addWidget(self.tree)
         self.view_stack.addWidget(self.grid)
@@ -717,6 +719,12 @@ class MainWindow(QMainWindow):
         m.addSeparator()
         a3 = m.addAction("모두 펼치기")
         a4 = m.addAction("모두 접기")
+        from .grid import is_video
+        a_play = None
+        if len(items) == 1 and is_video(items[0].data(0, ITEM_ROLE)) and not items[0].data(0, ITEM_ROLE).is_folder:
+            m.insertSeparator(m.actions()[0])
+            a_play = QAction("재생 (미리보기)", m)
+            m.insertAction(m.actions()[0], a_play)
         act = m.exec(self.tree.viewport().mapToGlobal(pos))
         if act in (a1, a2):
             for q in items:
@@ -724,6 +732,8 @@ class MainWindow(QMainWindow):
                     q.setCheckState(0, Qt.Checked if act == a1 else Qt.Unchecked)
         elif act == a3:
             self.tree.expandAll()
+        elif a_play is not None and act == a_play:
+            self.play_item(items[0])
         elif act == a4:
             self.tree.collapseAll()
 
@@ -760,6 +770,38 @@ class MainWindow(QMainWindow):
         self.sort_dir.setIcon(make_icon("desc" if self.s.sort_desc else "asc"))
         self.grid.set_sort(key if key in dict(SORT_KEYS) else "name", self.s.sort_desc)
         self.s.save()
+
+    # ================================================================ 영상 미리보기
+    def _tree_double(self, q: QTreeWidgetItem, _col: int):
+        from .grid import is_video
+        it = q.data(0, ITEM_ROLE)
+        if it is not None and not it.is_folder and is_video(it):
+            self.play_item(q)
+
+    def play_item(self, q: QTreeWidgetItem):
+        try:
+            from ..stream import StreamServer
+            from .player import PlayerDialog
+        except ImportError as e:   # QtMultimedia 없는 빌드
+            self._toast(f"이 버전에는 영상 플레이어가 없어요: {e}", error=True)
+            return
+        if getattr(self, "stream", None) is None:
+            self.stream = StreamServer()
+        if getattr(self, "player", None) is None:
+            self.player = PlayerDialog(self.stream, self.svc.source_for_item, self)
+        from .grid import is_video
+        if self.view_stack.currentIndex() == 1:
+            playlist = self.grid.visible_videos()
+        else:
+            par = q.parent()
+            sibs = [par.child(i) for i in range(par.childCount())] if par is not None else [q]
+            playlist = [c for c in sibs if not c.data(0, ITEM_ROLE).is_folder and is_video(c.data(0, ITEM_ROLE))]
+        if q not in playlist:
+            playlist = [q]
+        self.player.open_item(q, playlist)
+        self.player.show()
+        self.player.raise_()
+        self.player.activateWindow()
 
     def _set_view(self, i: int):
         self.view_group.button(i).setChecked(True)
@@ -1031,6 +1073,10 @@ class MainWindow(QMainWindow):
         if self._cancel:
             self._cancel.set()
         self.loader.shutdown()
+        if getattr(self, "player", None) is not None:
+            self.player.close()
+        if getattr(self, "stream", None) is not None:
+            self.stream.shutdown()
         self.svc.shutdown()   # 받던 연결을 모두 멈추고 파일을 닫은 뒤
         if discard:
             mgr.discard_unfinished()

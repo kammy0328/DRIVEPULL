@@ -72,6 +72,7 @@ def sort_value(it, key: str):
 
 class CardDelegate(QStyledItemDelegate):
     toggled = Signal(object)          # QTreeWidgetItem
+    play = Signal(object)             # QTreeWidgetItem (영상)
     META_H = 46
     PAD = 6
 
@@ -151,8 +152,8 @@ class CardDelegate(QStyledItemDelegate):
         rb = res_badge(it.width, it.height)
         if rb:
             self._badge(p, rb, th.right() - 8, th.top() + 8, align_right=True, top=True)
-        if not it.is_folder and is_video(it) and not it.duration_ms:
-            self._play_icon(p, th)
+        if not it.is_folder and is_video(it) and (hover or img is None):
+            self._play_icon(p, th, strong=hover)   # 가운데 재생 버튼 (누르면 미리보기)
         p.setClipping(False)
 
         # 체크박스
@@ -196,11 +197,11 @@ class CardDelegate(QStyledItemDelegate):
         p.drawText(r, Qt.AlignCenter, text)
 
     @staticmethod
-    def _play_icon(p, th):
+    def _play_icon(p, th, strong=False):
         c = th.center()
         r = min(th.width(), th.height()) * 0.11
         p.setPen(Qt.NoPen)
-        p.setBrush(QColor(255, 255, 255, 60))
+        p.setBrush(QColor(0, 0, 0, 150) if strong else QColor(255, 255, 255, 60))
         p.drawEllipse(c, r * 1.6, r * 1.6)
         path = QPainterPath()
         path.moveTo(c.x() - r * 0.55, c.y() - r * 0.8)
@@ -254,16 +255,24 @@ class CardDelegate(QStyledItemDelegate):
     def editorEvent(self, ev, model, opt, idx):
         if ev.type() == QEvent.MouseButtonRelease and ev.button() == Qt.LeftButton:
             _, _, box = self._rects(opt.rect)
+            q = idx.data(TREE_ROLE)
             if box.adjusted(-6, -6, 6, 6).contains(ev.position()):
-                q = idx.data(TREE_ROLE)
                 if q is not None:
                     self.toggled.emit(q)
+                return True
+            _, th, _ = self._rects(opt.rect)
+            r = min(th.width(), th.height()) * 0.18
+            c = th.center()
+            if q is not None and is_video(q.data(0, ITEM_ROLE)) and not q.data(0, ITEM_ROLE).is_folder \
+                    and abs(ev.position().x() - c.x()) <= r and abs(ev.position().y() - c.y()) <= r:
+                self.play.emit(q)
                 return True
         return super().editorEvent(ev, model, opt, idx)
 
 
 class ThumbGrid(QWidget):
     navigated = Signal()
+    play_requested = Signal(object)   # QTreeWidgetItem
 
     def __init__(self, loader, parent=None):
         super().__init__(parent)
@@ -314,6 +323,7 @@ class ThumbGrid(QWidget):
         self.delegate = CardDelegate(self)
         self.view.setItemDelegate(self.delegate)
         self.delegate.toggled.connect(self._toggle_one)
+        self.delegate.play.connect(self.play_requested.emit)
         self.view.itemDoubleClicked.connect(self._double)
         self.view.verticalScrollBar().valueChanged.connect(lambda *_: self._vis_timer.start())
         self.view.viewport().installEventFilter(self)
@@ -496,10 +506,23 @@ class ThumbGrid(QWidget):
 
     def _double(self, li: QListWidgetItem):
         q = li.data(TREE_ROLE)
-        if q.data(0, ITEM_ROLE).is_folder:
+        it = q.data(0, ITEM_ROLE)
+        if it.is_folder:
             self.open_folder(q)
+        elif is_video(it):
+            self.play_requested.emit(q)   # 영상은 더블클릭하면 재생
         else:
             self._toggle_one(q)
+
+    def visible_videos(self) -> list:
+        """지금 보이는 순서대로의 영상 항목 (플레이어 이전/다음용)."""
+        out = []
+        for i in range(self.view.count()):
+            q = self.view.item(i).data(TREE_ROLE)
+            it = q.data(0, ITEM_ROLE)
+            if not it.is_folder and is_video(it):
+                out.append(q)
+        return out
 
     def _enter_selected(self):
         sel = self.view.selectedItems()

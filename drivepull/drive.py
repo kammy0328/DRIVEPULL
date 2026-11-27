@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import html
 import re
+import unicodedata
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -102,6 +103,8 @@ class DriveItem:
 
 
 def safe_name(name: str) -> str:
+    # 맥에서 올린 파일은 한글이 자모 분리형(NFD)이라 Windows에서 "ㅎㅏㄴㄱㅡㄹ"처럼 보임 → 조합형(NFC)
+    name = unicodedata.normalize("NFC", name)
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip().rstrip(". ")
     if not name:
         name = "_"
